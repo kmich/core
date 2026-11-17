@@ -30,6 +30,7 @@ from homeassistant.requirements import (
 )
 
 from . import condition, config_validation as cv, trigger
+from .cluster import CLUSTER_CONFIG_KEY
 from .typing import ConfigType
 
 
@@ -181,6 +182,30 @@ async def async_check_ha_config_file(  # noqa: C901
         )
         core_config = {}
     core_config.pop(CONF_PACKAGES, None)
+
+    # The cluster is Core's own top-level key, set up by bootstrap: it is not
+    # an integration to look up.
+    if CLUSTER_CONFIG_KEY in config:
+        cluster_config = config.pop(CLUSTER_CONFIG_KEY)
+        try:
+            from homeassistant import cluster as cluster_package  # noqa: PLC0415
+        except ImportError as err:
+            result.add_warning(
+                f"The cluster configuration was not checked: {err}",
+                CLUSTER_CONFIG_KEY,
+                cluster_config,
+            )
+        else:
+            try:
+                result[CLUSTER_CONFIG_KEY] = cluster_package.CONFIG_SCHEMA(
+                    {CLUSTER_CONFIG_KEY: cluster_config}
+                )[CLUSTER_CONFIG_KEY]
+            except probatio.Invalid as err:
+                result.add_error(
+                    format_schema_error(hass, err, CLUSTER_CONFIG_KEY, cluster_config),
+                    CLUSTER_CONFIG_KEY,
+                    cluster_config,
+                )
 
     # Filter out repeating config sections
     components = {cv.domain_key(key) for key in config}

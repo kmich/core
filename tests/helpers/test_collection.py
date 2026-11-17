@@ -332,6 +332,124 @@ async def test_storage_collection_update_modifiet_at(
     assert modified_3 == modified_2
 
 
+async def test_storage_collection_registry_and_dump(hass: HomeAssistant) -> None:
+    """Test a loaded storage collection can be found and dumped."""
+    store = storage.Store(hass, 1, "test-data")
+    await store.async_save({"items": [{"id": "mock-1", "name": "Mock 1"}]})
+    coll = MockStorageCollection(store)
+    assert collection.async_get_storage_collection(hass, "test-data") is None
+
+    await coll.async_load()
+
+    assert collection.async_get_storage_collection(hass, "test-data") is coll
+    assert collection.async_get_storage_collection(hass, "other") is None
+    assert coll.async_dump() == {"items": [{"id": "mock-1", "name": "Mock 1"}]}
+
+
+async def test_storage_collection_replace(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test replacing the items keeps ids and tells listeners what changed."""
+    store = storage.Store(hass, 1, "test-data")
+    await store.async_save(
+        {
+            "items": [
+                {"id": "kept", "name": "Kept"},
+                {"id": "changed", "name": "Changed"},
+                {"id": "removed", "name": "Removed"},
+            ]
+        }
+    )
+    id_manager = collection.IDManager()
+    yaml_coll = collection.YamlCollection(_LOGGER, id_manager)
+    await yaml_coll.async_load([{"id": "from_yaml", "name": "YAML"}])
+    coll = MockStorageCollection(store, id_manager)
+    await coll.async_load()
+    change_sets: list[list[collection.CollectionChange]] = []
+
+    async def listener(change_set: list[collection.CollectionChange]) -> None:
+        change_sets.append(list(change_set))
+
+    coll.async_add_change_set_listener(listener)
+
+    await coll.async_replace(
+        {
+            "items": [
+                {"id": "kept", "name": "Kept"},
+                {"id": "changed", "name": "Changed again", "extra": [1, 2]},
+                {"id": "added", "name": "Added"},
+                {"id": "from_yaml", "name": "Clashes with YAML"},
+            ]
+        }
+    )
+
+    assert len(change_sets) == 1
+    assert [(c.change_type, c.item_id, c.item) for c in change_sets[0]] == [
+        (collection.CHANGE_REMOVED, "removed", {"id": "removed", "name": "Removed"}),
+        (
+            collection.CHANGE_UPDATED,
+            "changed",
+            {"id": "changed", "name": "Changed again", "extra": [1, 2]},
+        ),
+        (collection.CHANGE_ADDED, "added", {"id": "added", "name": "Added"}),
+    ]
+    assert all(change.item_hash for change in change_sets[0][1:])
+    assert list(coll.data) == ["kept", "changed", "added"]
+    assert "Duplicate ID 'from_yaml' detected, skipping" in caplog.text
+    assert yaml_coll.data["from_yaml"] == {"id": "from_yaml", "name": "YAML"}
+
+    # The same data again changes nothing.
+    await coll.async_replace(coll.async_dump())
+    assert len(change_sets) == 1
+
+    await flush_store(store)
+    assert await storage.Store(hass, 1, "test-data").async_load() == {
+        "items": [
+            {"id": "kept", "name": "Kept"},
+            {"id": "changed", "name": "Changed again", "extra": [1, 2]},
+            {"id": "added", "name": "Added"},
+        ]
+    }
+
+
+async def test_storage_collection_replace_updates_entities(
+    hass: HomeAssistant, entity_registry: er.EntityRegistry
+) -> None:
+    """Test entities of a replaced collection are added, updated and removed."""
+    store = storage.Store(hass, 1, "test-data")
+    await store.async_save(
+        {
+            "items": [
+                {"id": "mock_1", "state": "initial", "name": "Mock 1"},
+                {"id": "mock_2", "state": "initial", "name": "Mock 2"},
+            ]
+        }
+    )
+    ent_comp = entity_component.EntityComponent(_LOGGER, "test", hass)
+    await ent_comp.async_setup({})
+    coll = MockStorageCollection(store)
+    collection.sync_entity_lifecycle(hass, "test", "test", ent_comp, coll, MockEntity)
+    await coll.async_load()
+    assert hass.states.get("test.mock_2").state == "initial"
+
+    await coll.async_replace(
+        {
+            "items": [
+                {"id": "mock_1", "state": "second", "name": "Mock 1"},
+                {"id": "mock_3", "state": "new", "name": "Mock 3"},
+            ]
+        }
+    )
+
+    assert hass.states.get("test.mock_1").state == "second"
+    assert hass.states.get("test.mock_2") is None
+    assert entity_registry.async_get_entity_id("test", "test", "mock_2") is None
+    assert hass.states.get("test.mock_3").state == "new"
+    assert entity_registry.async_get_entity_id("test", "test", "mock_3") == (
+        "test.mock_3"
+    )
+
+
 async def test_attach_entity_component_collection(hass: HomeAssistant) -> None:
     """Test attaching collection to entity component."""
     ent_comp = entity_component.EntityComponent(_LOGGER, "test", hass)

@@ -206,7 +206,7 @@ class CategoryRegistry(BaseRegistry[CategoryRegistryStoreData]):
     @override
     async def _async_load(self) -> None:
         """Load the category registry."""
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
         category_entries: dict[str, dict[str, CategoryEntry]] = {}
 
         if data is not None:

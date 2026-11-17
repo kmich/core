@@ -2,10 +2,11 @@
 
 import asyncio
 from collections.abc import Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import timedelta
 import logging
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant import config as conf_util
 from homeassistant.config_entries import ConfigEntry
@@ -15,6 +16,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.core import (
+    CALLBACK_TYPE,
     EntityServiceResponse,
     Event,
     HassJobType,
@@ -32,12 +34,36 @@ from homeassistant.loader import async_get_integration
 from homeassistant.setup import async_prepare_setup_platform
 from homeassistant.util.hass_dict import HassKey
 
-from . import discovery, entity, service
+from . import cluster, discovery, entity, service
 from .entity_platform import EntityPlatform
 from .typing import ConfigType, DiscoveryInfoType, VolDictType, VolSchemaType
 
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=15)
+
+type _PlatformRequest = tuple[str, ConfigType, DiscoveryInfoType | None]
+type _PlatformKey = tuple[str, timedelta | None, str | None]
 DATA_INSTANCES: HassKey[dict[str, EntityComponent]] = HassKey("entity_components")
+
+
+def _idle_event() -> asyncio.Event:
+    event = asyncio.Event()
+    event.set()
+    return event
+
+
+@dataclass(slots=True)
+class _LeaderOnlyPlatforms:
+    """Platforms of a component that run on the cluster leader only."""
+
+    # Not set up because this instance is not the leader.
+    deferred: list[_PlatformRequest] = field(default_factory=list)
+    # Set up while this instance is the leader, by platform key.
+    running: dict[_PlatformKey, list[_PlatformRequest]] = field(default_factory=dict)
+    # Changes of leadership are applied one at a time.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Setups that passed the leadership check, and an event set while none.
+    setups: int = 0
+    idle: asyncio.Event = field(default_factory=_idle_event)
 
 
 async def async_update_entity(hass: HomeAssistant, entity_id: str) -> None:
@@ -92,6 +118,10 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
         self._platforms: dict[
             str | tuple[str, timedelta | None, str | None], EntityPlatform
         ] = {}
+        # In a cluster, platforms set up from YAML or by discovery run on the
+        # leader only (None without a cluster).
+        self._leader_only: _LeaderOnlyPlatforms | None = None
+        self._unsub_leadership: CALLBACK_TYPE | None = None
         domain_platform = self._async_init_entity_platform(domain, domain, None)
         self.async_add_entities = domain_platform.async_add_entities
         self.add_entities = domain_platform.add_entities
@@ -140,6 +170,13 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
         self.register_shutdown()
 
         self.config = config
+
+        if self._unsub_leadership is None and cluster.async_is_clustered(self.hass):
+            if self._leader_only is None:
+                self._leader_only = _LeaderOnlyPlatforms()
+            self._unsub_leadership = cluster.async_track_leadership(
+                self.hass, self._async_leadership_changed
+            )
 
         # Look in config for Domain, Domain 2, Domain 3 etc and load them
         for p_type, p_config in conf_util.config_per_platform(config, self.domain):
@@ -303,6 +340,45 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
         if self.config is None:
             raise RuntimeError("async_setup needs to be called first")
 
+        # In a cluster, a platform set up from YAML or by discovery runs on the
+        # leader only.
+        if (
+            leader_only := self._leader_only
+        ) is None or cluster.async_domain_runs_on_every_instance(
+            self.hass, platform_type
+        ):
+            await self._async_setup_platform(
+                platform_type, platform_config, discovery_info
+            )
+            return
+
+        request = (platform_type, platform_config, discovery_info)
+        if not cluster.async_is_leader(self.hass):
+            leader_only.deferred.append(request)
+            return
+        # Counted before the first await: a demotion waits for this setup to
+        # finish, then takes the platform down again.
+        leader_only.setups += 1
+        leader_only.idle.clear()
+        try:
+            await self._async_setup_platform(
+                platform_type, platform_config, discovery_info, leader_only
+            )
+        finally:
+            leader_only.setups -= 1
+            if not leader_only.setups:
+                leader_only.idle.set()
+
+    async def _async_setup_platform(
+        self,
+        platform_type: str,
+        platform_config: ConfigType,
+        discovery_info: DiscoveryInfoType | None,
+        leader_only: _LeaderOnlyPlatforms | None = None,
+    ) -> None:
+        """Set up a platform; ``leader_only`` for one that runs on the leader."""
+        if TYPE_CHECKING:
+            assert self.config is not None
         platform = await async_prepare_setup_platform(
             self.hass, self.config, self.domain, platform_type
         )
@@ -318,12 +394,70 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
 
         key = (platform_type, scan_interval, entity_namespace)
 
+        if leader_only is not None:
+            request = (platform_type, platform_config, discovery_info)
+            if not cluster.async_is_leader(self.hass):
+                # Leadership was lost while the platform was prepared.
+                leader_only.deferred.append(request)
+                return
+            leader_only.running.setdefault(key, []).append(request)
+
         if key not in self._platforms:
             self._async_init_entity_platform(
                 key, platform_type, platform, scan_interval, entity_namespace
             )
 
         await self._platforms[key].async_setup(platform_config, discovery_info)
+
+    @callback
+    def _async_leadership_changed(self, leader: bool) -> None:
+        """Set up or take down the platforms that run on the leader only."""
+        if (leader_only := self._leader_only) is None or not (
+            leader_only.deferred or leader_only.running or leader_only.setups
+        ):
+            return
+        task = self.hass.async_create_task_internal(
+            self._async_apply_leadership(leader_only),
+            f"EntityComponent leadership {self.domain}",
+            eager_start=True,
+        )
+        if not leader:
+            # The former leader runs these platforms until the task is done.
+            cluster.async_add_transition_task(
+                self.hass, task, f"taking down {self.domain} platforms"
+            )
+
+    async def _async_apply_leadership(self, leader_only: _LeaderOnlyPlatforms) -> None:
+        """Make the platforms match the current leadership.
+
+        The tasks of one component run one at a time, and each looks at the
+        leadership as it is when it runs, so a quick change back and forth
+        ends in the right state.
+        """
+        async with leader_only.lock:
+            if cluster.async_is_leader(self.hass):
+                deferred, leader_only.deferred = leader_only.deferred, []
+                for request in deferred:
+                    await self.async_setup_platform(*request)
+                return
+            # Setups that passed the leadership check finish first; each is
+            # in ``running`` (or deferred again) once it is done.
+            await leader_only.idle.wait()
+            left_running: list[str] = []
+            for key in list(leader_only.running):
+                requests = leader_only.running.pop(key)
+                leader_only.deferred.extend(requests)
+                if (platform := self._platforms.get(key)) is None:
+                    continue
+                await self._async_destroy_platform(key)
+                left_running.extend(platform.failed_removals)
+            if left_running:
+                # Entity removal logs its errors and goes on; these entities
+                # did not stop.
+                raise HomeAssistantError(
+                    f"Entities of {self.domain} platforms did not stop:"
+                    f" {', '.join(left_running)}"
+                )
 
     async def _async_reset(self) -> None:
         """Remove entities and reset the entity component to initial values.
@@ -341,6 +475,10 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
         if tasks:
             await asyncio.gather(*tasks)
 
+        # A reload starts from the new configuration.
+        if self._leader_only is not None:
+            self._leader_only.deferred.clear()
+            self._leader_only.running.clear()
         self.config = None
 
     async def async_remove_entity(self, entity_id: str) -> None:
@@ -417,5 +555,8 @@ class EntityComponent[_EntityT: entity.Entity = entity.Entity]:
     @callback
     def _async_shutdown(self, event: Event) -> None:
         """Call when Home Assistant is stopping."""
+        if self._unsub_leadership is not None:
+            self._unsub_leadership()
+            self._unsub_leadership = None
         for platform in self._platforms.values():
             platform.async_shutdown()

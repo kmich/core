@@ -309,7 +309,7 @@ class FloorRegistry(BaseRegistry[FloorRegistryStoreData]):
     @override
     async def _async_load(self) -> None:
         """Load the floor registry."""
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
         floors = FloorRegistryItems()
 
         if data is not None:

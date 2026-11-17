@@ -24,9 +24,11 @@ from homeassistant.components.system_health import DOMAIN as SYSTEM_HEALTH_DOMAI
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     HomeAssistantError,
+    ServiceNotFound,
     ServiceValidationError,
     Unauthorized,
 )
+from homeassistant.helpers import cluster
 from homeassistant.loader import Integration
 from homeassistant.setup import async_setup_component
 from homeassistant.util.yaml.loader import JSON_TYPE
@@ -945,6 +947,54 @@ async def test_api_call_service_not_found(
     """Test if the API fails 400 if unknown service."""
     resp = await mock_api_client.post("/api/services/test_domain/test_service")
     assert resp.status == HTTPStatus.BAD_REQUEST
+
+
+async def test_api_call_service_routed_in_a_cluster(
+    hass: HomeAssistant, mock_api_client: TestClient
+) -> None:
+    """On a cluster standby, a service registered only on the leader is routed.
+
+    The integration that registers it runs on another instance: the call goes
+    to the router, which runs it there and checks it there (an unknown
+    service is still a 400).
+    """
+    calls: list[tuple[str, str, bool]] = []
+
+    class _Router:
+        async def async_route_service_call(
+            self,
+            domain: str,
+            service: str,
+            service_data: dict[str, Any] | None,
+            blocking: bool,
+            context: ha.Context | None,
+            target: dict[str, Any] | None,
+            return_response: bool,
+        ) -> ha.ServiceResponse:
+            calls.append((domain, service, return_response))
+            if service == "missing":
+                raise ServiceNotFound(domain, service)
+            return {"done": True} if return_response else None
+
+    cluster.async_set_leader(hass, False)  # a standby of a cluster
+    remove = hass.services.async_set_router(_Router())
+    try:
+        resp = await mock_api_client.post("/api/services/knx/send", json={"a": 1})
+        assert resp.status == HTTPStatus.OK
+        resp = await mock_api_client.post(
+            "/api/services/knx/read?return_response", json={}
+        )
+        assert resp.status == HTTPStatus.OK
+        assert (await resp.json())["service_response"] == {"done": True}
+        resp = await mock_api_client.post("/api/services/knx/missing")
+        assert resp.status == HTTPStatus.BAD_REQUEST
+    finally:
+        remove()
+    assert calls == [
+        ("knx", "send", False),
+        ("knx", "read", True),
+        ("knx", "missing", False),
+    ]
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from collections.abc import Generator, Iterable
 import contextlib
 import glob
 import os
+from pathlib import Path
 import sys
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
@@ -22,7 +23,7 @@ from pytest_homeassistant.common import (
 from syrupy.assertion import SnapshotAssertion
 
 from homeassistant import bootstrap, config as config_util, core, loader, runner
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import (
     BASE_PLATFORMS,
     CONF_DEBUG,
@@ -30,6 +31,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import CoreState, HomeAssistant, async_get_hass, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import cluster, issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.translation import async_translations_loaded
 from homeassistant.helpers.typing import ConfigType
@@ -1009,6 +1011,97 @@ async def test_setup_hass_recovery_mode_with_failing_integration(
     assert domain not in hass.config.components
 
 
+async def test_recovery_mode_of_a_cluster_member_fails_closed(
+    mock_enable_logging: AsyncMock,
+    mock_ensure_config_exists: AsyncMock,
+    mock_process_ha_config_upgrade: Mock,
+) -> None:
+    """Recovery mode of a cluster member keeps clustered entries unloaded."""
+    original = bootstrap.async_from_config_dict
+    calls = 0
+
+    async def _from_config_dict(
+        config: ConfigType, hass: HomeAssistant
+    ) -> HomeAssistant | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None  # the core integrations failed: recovery mode
+        return await original(config, hass)
+
+    with (
+        patch(
+            "homeassistant.config.async_hass_config_yaml",
+            return_value={"cluster": {"node_id": "node_a"}},
+        ),
+        patch.object(
+            bootstrap, "async_from_config_dict", side_effect=_from_config_dict
+        ),
+    ):
+        hass = await bootstrap.async_setup_hass(
+            runner.RuntimeConfig(
+                config_dir=get_test_config_dir(),
+                verbose=False,
+                log_rotate_days=10,
+                log_file="",
+                log_no_color=False,
+                skip_pip=True,
+                recovery_mode=False,
+            ),
+        )
+
+    assert "recovery_mode" in hass.config.components
+    assert isinstance(
+        hass.config_entries.async_get_placement(), cluster.FailClosedPlacement
+    )
+    assert not cluster.async_is_leader(hass)
+
+
+async def test_recovery_mode_ignores_a_stale_cluster_marker(
+    mock_enable_logging: AsyncMock,
+    mock_ensure_config_exists: AsyncMock,
+    mock_process_ha_config_upgrade: Mock,
+) -> None:
+    """A configuration without a cluster wins over the marker of an earlier one."""
+    original = bootstrap.async_from_config_dict
+    isfile = os.path.isfile
+    calls = 0
+
+    def _isfile(path: str) -> bool:
+        return str(path).endswith(os.path.join(".storage", "cluster")) or isfile(path)
+
+    async def _from_config_dict(
+        config: ConfigType, hass: HomeAssistant
+    ) -> HomeAssistant | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None  # the core integrations failed: recovery mode
+        return await original(config, hass)
+
+    with (
+        patch("homeassistant.config.async_hass_config_yaml", return_value={}),
+        patch.object(bootstrap.os.path, "isfile", _isfile),
+        patch.object(
+            bootstrap, "async_from_config_dict", side_effect=_from_config_dict
+        ),
+    ):
+        hass = await bootstrap.async_setup_hass(
+            runner.RuntimeConfig(
+                config_dir=get_test_config_dir(),
+                verbose=False,
+                log_rotate_days=10,
+                log_file="",
+                log_no_color=False,
+                skip_pip=True,
+                recovery_mode=False,
+            ),
+        )
+
+    assert "recovery_mode" in hass.config.components
+    assert hass.config_entries.async_get_placement() is None
+
+
 @pytest.mark.usefixtures("mock_hass_config")
 async def test_setup_hass_safe_mode(
     mock_enable_logging: AsyncMock,
@@ -1877,3 +1970,260 @@ async def test_recorder_not_promoted(hass: HomeAssistant) -> None:
     )
 
     assert "recorder" not in all_integrations
+
+
+async def _assert_fail_closed(hass: HomeAssistant) -> None:
+    assert isinstance(
+        hass.config_entries.async_get_placement(), cluster.FailClosedPlacement
+    )
+    assert not cluster.async_is_leader(hass)
+    mock_integration(hass, MockModule("hub_like"))
+    entry = MockConfigEntry(domain="hub_like")
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.NOT_LOADED
+
+
+async def test_cluster_setup_failure_stays_fail_closed(hass: HomeAssistant) -> None:
+    """A cluster that cannot set up leaves entries that need it unloaded."""
+    cluster.async_install_fail_closed(hass)
+    config = {"cluster": {"node_id": "node_a"}, "other": {}}
+
+    with patch(
+        "homeassistant.cluster.async_setup_cluster", AsyncMock(return_value=False)
+    ) as setup:
+        rest = await bootstrap._async_setup_cluster(hass, config)
+
+    assert rest == {"other": {}}
+    setup.assert_awaited_once_with(hass, {"node_id": "node_a"})
+    await _assert_fail_closed(hass)
+
+
+async def test_cluster_without_nats_stays_fail_closed(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without the optional nats-py package a cluster member runs no entries."""
+    cluster.async_install_fail_closed(hass)
+
+    with patch.dict(sys.modules, {"homeassistant.cluster": None}):
+        rest = await bootstrap._async_setup_cluster(
+            hass, {"cluster": {"node_id": "node_a"}}
+        )
+
+    assert rest == {}
+    assert "The cluster needs the optional package nats-py" in caplog.text
+    await _assert_fail_closed(hass)
+
+
+@pytest.mark.parametrize(
+    ("yaml", "marker", "expected"),
+    [
+        pytest.param({"cluster": {}}, False, True, id="readable_with_cluster"),
+        pytest.param(
+            {"cluster": {}}, True, True, id="readable_with_cluster_and_marker"
+        ),
+        pytest.param({}, True, False, id="readable_without_cluster_ignores_marker"),
+        pytest.param(None, True, True, id="unreadable_with_marker"),
+        pytest.param(None, False, False, id="unreadable_without_any_evidence"),
+    ],
+)
+async def test_forced_recovery_detects_cluster_membership(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    yaml: dict[str, Any] | None,
+    marker: bool,
+    expected: bool,
+) -> None:
+    """Recovery mode asked for explicitly reads the configuration, then the marker."""
+    if marker:
+        hass_storage["cluster"] = {"version": 1, "data": {"member": True}}
+    read = (
+        {"return_value": yaml}
+        if yaml is not None
+        else {"side_effect": HomeAssistantError("broken")}
+    )
+
+    with patch("homeassistant.config.async_hass_config_yaml", AsyncMock(**read)):
+        assert await bootstrap._async_is_cluster_member(hass, None) is expected
+
+
+async def test_cluster_membership_is_remembered_before_the_cluster_sets_up(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Startup writes the marker even if the cluster cannot be imported."""
+    with patch.dict(sys.modules, {"homeassistant.cluster": None}):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+
+    assert "cluster" in hass_storage
+    assert await cluster.async_has_membership_marker(hass)
+
+
+@pytest.mark.parametrize("load_registries", [False])
+async def test_no_fail_closed_without_a_cluster(hass: HomeAssistant) -> None:
+    """Without a configured cluster nothing changes."""
+    await bootstrap.async_from_config_dict({}, hass)
+    assert hass.config_entries.async_get_placement() is None
+    assert not cluster.async_is_clustered(hass)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("cluster:\n  node_id: [\n", True),
+        ("homeassistant:\n  name: [\n", False),
+        ("# cluster:\nhomeassistant:\n  name: x\n  cluster: no\n", False),
+    ],
+)
+async def test_unreadable_configuration_that_names_a_cluster_is_a_member(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    tmp_path: Path,
+    text: str,
+    expected: bool,
+) -> None:
+    """No marker yet (a first start) and YAML that does not parse: read the text."""
+    (tmp_path / "configuration.yaml").write_text(text)
+    hass.config.config_dir = str(tmp_path)
+
+    with patch(
+        "homeassistant.config.async_hass_config_yaml",
+        AsyncMock(side_effect=HomeAssistantError("broken")),
+    ):
+        assert await bootstrap._async_is_cluster_member(hass, None) is expected
+
+
+async def test_marker_is_cleared_when_the_readable_configuration_has_no_cluster(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """An instance that left the cluster is not taken for a member afterwards."""
+    hass_storage["cluster"] = {"version": 1, "data": {"member": True}}
+
+    assert await bootstrap._async_setup_cluster(hass, {}) == {}
+
+    assert "cluster" not in hass_storage
+
+
+async def test_cluster_requirements_are_installed_before_the_cluster_is_imported(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """``nats-py`` is on no requirements list: bootstrap installs it, like pip would."""
+    calls: list[list[str]] = []
+    hass.config.skip_pip = False
+
+    async def process(hass: HomeAssistant, name: str, reqs: list[str]) -> None:
+        calls.append(reqs)
+
+    with (
+        patch("homeassistant.requirements.async_process_requirements", process),
+        patch.dict(sys.modules, {"homeassistant.cluster": None}),
+    ):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+
+    assert calls == [["nats-py[nkeys]==2.16.0"]]
+
+
+async def test_cluster_requirements_that_cannot_be_installed_keep_entries_unloaded(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed installation is an error in the log, and the cluster stays down."""
+    from homeassistant.requirements import RequirementsNotFound  # noqa: PLC0415
+
+    hass.config.skip_pip = False
+    with patch(
+        "homeassistant.requirements.async_process_requirements",
+        AsyncMock(side_effect=RequirementsNotFound("cluster", ["nats-py"])),
+    ):
+        config = await bootstrap._async_setup_cluster(
+            hass, {"cluster": {"node_id": "node_a"}, "light": {}}
+        )
+
+    assert config == {"light": {}}
+    assert "Could not install the packages the cluster needs" in caplog.text
+
+
+def _cluster_issue(hass: HomeAssistant, issue_id: str) -> Any:
+    return ir.async_get(hass).async_get_issue("homeassistant", issue_id)
+
+
+async def test_cluster_that_cannot_be_set_up_is_a_repair_issue(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Every way the cluster cannot start tells the user, not only the log."""
+    from homeassistant.requirements import RequirementsNotFound  # noqa: PLC0415
+
+    # The packages cannot be installed.
+    hass.config.skip_pip = False
+    with patch(
+        "homeassistant.requirements.async_process_requirements",
+        AsyncMock(side_effect=RequirementsNotFound("cluster", ["nats-py"])),
+    ):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+    issue = _cluster_issue(hass, "cluster_setup_failed")
+    assert issue is not None
+    assert issue.translation_key == "cluster_setup_failed"
+    assert "nats-py" in issue.translation_placeholders["reason"]
+    assert "install" in issue.translation_placeholders["reason"]
+
+    # The package is installed but cannot be imported.
+    ir.async_delete_issue(hass, "homeassistant", "cluster_setup_failed")
+    hass.config.skip_pip = True
+    with patch.dict(sys.modules, {"homeassistant.cluster": None}):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+    issue = _cluster_issue(hass, "cluster_setup_failed")
+    assert issue is not None
+    assert "cannot be imported" in issue.translation_placeholders["reason"]
+
+
+async def test_invalid_cluster_configuration_is_a_repair_issue_without_secrets(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """The issue names where the configuration is wrong, and never quotes it."""
+    hass.config.skip_pip = True
+    await bootstrap._async_setup_cluster(
+        hass,
+        {
+            "cluster": {
+                "node_id": "not a valid id!",
+                "nats_url": "nats://user:hunter2_password@nats.example:4222",
+            }
+        },
+    )
+    issue = _cluster_issue(hass, "cluster_setup_failed")
+    assert issue is not None
+    assert "node_id" in issue.translation_placeholders["reason"]
+    assert "hunter2_password" not in str(issue.translation_placeholders)
+
+
+async def test_cluster_repair_issue_is_cleared_when_the_cluster_works_or_is_gone(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """The issue does not outlive its cause."""
+    hass.config.skip_pip = True
+    cluster.async_report_setup_failed(hass, "a reason")
+    with patch(
+        "homeassistant.cluster.async_setup_cluster", AsyncMock(return_value=True)
+    ):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+    assert _cluster_issue(hass, "cluster_setup_failed") is None
+
+    cluster.async_report_setup_failed(hass, "a reason")
+    await bootstrap._async_setup_cluster(hass, {})
+    assert _cluster_issue(hass, "cluster_setup_failed") is None
+
+
+async def test_cluster_requirements_are_not_installed_with_skip_pip(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """``skip_pip`` is honoured: nothing is installed."""
+    hass.config.skip_pip = True
+    install = AsyncMock()
+
+    with (
+        patch("homeassistant.requirements.async_process_requirements", install),
+        patch.dict(sys.modules, {"homeassistant.cluster": None}),
+    ):
+        await bootstrap._async_setup_cluster(hass, {"cluster": {"node_id": "node_a"}})
+
+    install.assert_not_called()

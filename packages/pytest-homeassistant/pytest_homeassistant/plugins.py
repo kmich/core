@@ -818,12 +818,15 @@ async def stop_hass() -> AsyncGenerator[None]:
     event_loop = asyncio.get_running_loop()
     created = []
 
-    def mock_hass(*args):
-        hass_inst = orig_hass(*args)
-        created.append(hass_inst)
-        return hass_inst
+    orig_init = orig_hass.__init__
 
-    with patch("homeassistant.core.HomeAssistant", mock_hass):
+    # Track the instances through ``__init__``: replacing the class itself would
+    # break ``isinstance(obj, HomeAssistant)`` in homeassistant.core.
+    def tracking_init(self: ha.HomeAssistant, *args: Any, **kwargs: Any) -> None:
+        created.append(self)
+        orig_init(self, *args, **kwargs)
+
+    with patch.object(orig_hass, "__init__", tracking_init):
         yield
 
     for hass_inst in created:

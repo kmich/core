@@ -1,0 +1,129 @@
+name: Cluster tests
+
+# The cluster tests need a real NATS server with JetStream, so the main test
+# jobs (which have no server, and a 9 second timeout per test) skip them. This
+# job runs them. The end-to-end harness (two Home Assistant containers) is not
+# part of it: it needs an image built from this commit, see tests/cluster/harness.
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    paths:
+      - "homeassistant/cluster/**"
+      - "homeassistant/bootstrap.py"
+      - "homeassistant/config_entries.py"
+      - "homeassistant/core.py"
+      - "homeassistant/helpers/cluster.py"
+      - "homeassistant/helpers/collection.py"
+      - "homeassistant/helpers/entity_component.py"
+      - "homeassistant/helpers/entity_platform.py"
+      - "homeassistant/helpers/registry.py"
+      - "homeassistant/helpers/storage.py"
+      - "homeassistant/components/automation/**"
+      - "homeassistant/components/hassio/discovery.py"
+      - "homeassistant/components/homeassistant/**"
+      - "homeassistant/components/script/**"
+      - "tests/cluster/**"
+      - "tests/components/hassio/test_discovery_standby.py"
+      - "tests/components/homeassistant/test_repairs_standby.py"
+      - "tests/helpers/test_cluster.py"
+      - "tests/test_bootstrap_cluster_recovery.py"
+      - ".github/workflows/cluster.yaml"
+      - "pyproject.toml"
+      - "requirements_test.txt"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cluster:
+    name: Cluster tests (NATS ${{ matrix.nats }})
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        nats: ["2.15.3"]
+    env:
+      NATS_IMAGE: nats:${{ matrix.nats }}-alpine
+      CLUSTER_TEST_NATS_URL: nats://127.0.0.1:4222
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip uv
+          uv pip install --system -r requirements.txt -r requirements_test.txt \
+            -e packages/pytest-homeassistant
+      - name: Compile the English translations
+        run: python -m script.translations develop --all
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 127.0.0.1:4222:4222 "${NATS_IMAGE}" -js
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null && break
+            sleep 1
+          done
+      - name: Run the cluster tests
+        run: |
+          python -m pytest -p no:sugar -q \
+            --timeout=180 \
+            --durations=10 \
+            tests/cluster tests/helpers/test_cluster.py \
+            tests/test_bootstrap_cluster_recovery.py \
+            tests/components/hassio/test_discovery_standby.py \
+            tests/components/homeassistant/test_repairs_standby.py
+      - name: Start NATS with the node permissions of the README
+        run: |
+          docker run -d --name nats-perm \
+            -p 127.0.0.1:4223:4222 \
+            -v "${GITHUB_WORKSPACE}/tests/cluster/harness/nats-permissions.conf:/nats.conf:ro" \
+            "${NATS_IMAGE}" -js -c /nats.conf
+          sleep 3
+      - name: Run the permission test
+        env:
+          CLUSTER_TEST_NATS_URL: nats://admin:secret_admin@127.0.0.1:4223
+          CLUSTER_TEST_NATS_PERMISSIONS: "1"
+        run: |
+          python -m pytest -p no:sugar -q --timeout=180 \
+            tests/cluster/test_permissions.py
+      - name: Start NATS with TLS
+        run: |
+          tls_dir="${RUNNER_TEMP}/nats-tls"
+          mkdir -p "${tls_dir}"
+          cd "${tls_dir}" || exit 1
+          printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' > ext.cnf
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=cluster-test-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -keyout ca.key -out ca.pem
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" \
+            -keyout server.key -out server.csr
+          openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+            -days 1 -extfile ext.cnf -out server.pem
+          chmod 644 server.key
+          printf 'port: 4222\njetstream: {store_dir: /tmp/js}\ntls {\n cert_file: "/tls/server.pem"\n key_file: "/tls/server.key"\n}\n' > nats.conf
+          docker run -d --name nats-tls \
+            -p 127.0.0.1:4224:4222 \
+            -v "${tls_dir}:/tls:ro" \
+            "${NATS_IMAGE}" -c /tls/nats.conf
+          sleep 3
+          echo "CLUSTER_TEST_NATS_TLS_CA=${tls_dir}/ca.pem" >> "${GITHUB_ENV}"
+      - name: Run the TLS test
+        env:
+          CLUSTER_TEST_NATS_TLS_URL: tls://127.0.0.1:4224
+        run: |
+          python -m pytest -p no:sugar -q --timeout=180 \
+            tests/cluster/test_tls.py::test_strict_mode_accepts_a_server_with_tls

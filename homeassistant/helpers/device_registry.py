@@ -4463,12 +4463,13 @@ class DeviceRegistry(BaseRegistry[dict[str, list[dict[str, Any]]]]):
     @override
     async def _async_load(self) -> None:
         """Load the device registry."""
-        if self._loaded_event.is_set():
-            raise RuntimeError("Device registry is already loaded")
+        if self._replacement is None:
+            if self._loaded_event.is_set():
+                raise RuntimeError("Device registry is already loaded")
 
-        async_setup_cleanup(self.hass, self)
+            async_setup_cleanup(self.hass, self)
 
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
 
         devices = ActiveDeviceRegistryItems()
         child_devices = ChildDeviceRegistryItems()

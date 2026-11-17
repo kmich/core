@@ -1,10 +1,12 @@
 """The tests for the Entity component helper."""
 
+import asyncio
 from collections import OrderedDict
 from collections.abc import Generator
 from datetime import timedelta
 import logging
 import re
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 from freezegun import freeze_time
@@ -40,7 +42,12 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import HomeAssistantError, PlatformNotReady, Unauthorized
-from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers import (
+    cluster,
+    config_validation as cv,
+    discovery,
+    entity_component,
+)
 from homeassistant.helpers.entity_component import EntityComponent, async_update_entity
 from homeassistant.helpers.entity_platform import (
     AddConfigEntryEntitiesCallback,
@@ -990,3 +997,201 @@ async def test_setup_entry_platform_failed(
     # A failing forwarded platform does not change the state of the entry
     assert config_entry.state is ConfigEntryState.LOADED
     assert f"Failed to set up the test {domain} platform" in caplog.text
+
+
+async def _setup_gated_platform(
+    hass: HomeAssistant, setups: list[str], domain: str = "yaml_platform"
+) -> EntityComponent:
+    """Set up an entity component with a YAML platform that records its setups."""
+
+    async def async_platform_setup(
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_entities: AddEntitiesCallback,
+        discovery_info: DiscoveryInfoType | None = None,
+    ) -> None:
+        setups.append(domain)
+        async_add_entities([MockEntity(name="yaml entity", unique_id=None)])
+
+    mock_integration(hass, MockModule(domain))
+    mock_platform(
+        hass,
+        f"{domain}.{DOMAIN}",
+        MockPlatform(async_setup_platform=async_platform_setup),
+    )
+    component = EntityComponent(_LOGGER, DOMAIN, hass)
+    await component.async_setup({DOMAIN: {"platform": domain}})
+    await hass.async_block_till_done()
+    return component
+
+
+async def test_platform_deferred_until_leader(hass: HomeAssistant) -> None:
+    """A YAML platform waits for leadership in a cluster, and runs once leading."""
+    cluster.async_set_leader(hass, False)
+    setups: list[str] = []
+
+    component = await _setup_gated_platform(hass, setups)
+
+    assert setups == []
+    assert component._platforms.keys() == {DOMAIN}
+    assert len(component._leader_only.deferred) == 1
+
+    cluster.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+
+    assert setups == ["yaml_platform"]
+    assert component._leader_only.deferred == []
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+
+async def test_platform_destroyed_on_demotion_and_set_up_again(
+    hass: HomeAssistant,
+) -> None:
+    """The platform is destroyed when leadership is lost and set up on the next."""
+    cluster.async_set_leader(hass, False)
+    setups: list[str] = []
+    component = await _setup_gated_platform(hass, setups)
+    cluster.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+    assert setups == ["yaml_platform"]
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+    cluster.async_set_leader(hass, False)
+    await hass.async_block_till_done()
+
+    assert hass.states.get("test_domain.yaml_entity") is None
+    assert component._platforms.keys() == {DOMAIN}
+    assert len(component._leader_only.deferred) == 1
+
+    cluster.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+
+    assert setups == ["yaml_platform", "yaml_platform"]
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+
+async def test_platform_of_an_every_instance_domain_is_not_deferred(
+    hass: HomeAssistant,
+) -> None:
+    """A platform of a domain that runs on every instance is set up at once."""
+    cluster.async_set_leader(hass, False)
+    cluster.async_set_every_instance_domains(hass, {"yaml_platform"})
+    setups: list[str] = []
+
+    component = await _setup_gated_platform(hass, setups)
+
+    assert setups == ["yaml_platform"]
+    assert component._leader_only.deferred == []
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+    # Leadership changes do not touch it.
+    cluster.async_set_leader(hass, True)
+    cluster.async_set_leader(hass, False)
+    await hass.async_block_till_done()
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+
+async def test_platform_without_a_cluster_is_set_up_at_once(
+    hass: HomeAssistant,
+) -> None:
+    """Without a cluster role every instance is the leader: nothing is deferred."""
+    setups: list[str] = []
+
+    component = await _setup_gated_platform(hass, setups)
+
+    assert setups == ["yaml_platform"]
+    assert component._leader_only is None
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+
+async def test_reset_clears_the_deferred_platforms(hass: HomeAssistant) -> None:
+    """A reload starts from the new configuration, not from the deferred one."""
+    cluster.async_set_leader(hass, False)
+    setups: list[str] = []
+    component = await _setup_gated_platform(hass, setups)
+    assert len(component._leader_only.deferred) == 1
+
+    await component._async_reset()
+    cluster.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+
+    assert setups == []
+    assert component._leader_only.deferred == []
+    assert component._leader_only.running == {}
+
+
+async def test_demotion_while_a_platform_is_prepared(hass: HomeAssistant) -> None:
+    """A platform that loses leadership while it is prepared is not set up.
+
+    Regression test: the leadership check passed, then the platform module was
+    loaded; a demotion meanwhile found nothing to take down.
+    """
+    cluster.async_set_leader(hass, True)
+    setups: list[str] = []
+    prepared = asyncio.Event()
+    resume = asyncio.Event()
+    original = entity_component.async_prepare_setup_platform
+
+    async def _paused_prepare(*args: Any) -> Any:
+        prepared.set()
+        await resume.wait()
+        return await original(*args)
+
+    with patch.object(
+        entity_component, "async_prepare_setup_platform", _paused_prepare
+    ):
+        setup = hass.async_create_task(_setup_gated_platform(hass, setups))
+        await prepared.wait()
+        cluster.async_set_leader(hass, False)
+        assert cluster.async_transitions_pending(hass)
+        resume.set()
+        component = await setup
+
+    await cluster.async_wait_transitions(hass)
+    assert setups == []
+    assert hass.states.get("test_domain.yaml_entity") is None
+    assert len(component._leader_only.deferred) == 1
+
+    cluster.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+    assert setups == ["yaml_platform"]
+    assert hass.states.get("test_domain.yaml_entity") is not None
+
+
+async def test_demotion_waits_for_a_platform_setup(hass: HomeAssistant) -> None:
+    """A demotion during a platform's setup takes the platform down after it."""
+    cluster.async_set_leader(hass, True)
+    started = asyncio.Event()
+    resume = asyncio.Event()
+    domain = "slow_platform"
+
+    async def async_platform_setup(
+        hass: HomeAssistant,
+        config: ConfigType,
+        async_add_entities: AddEntitiesCallback,
+        discovery_info: DiscoveryInfoType | None = None,
+    ) -> None:
+        started.set()
+        await resume.wait()
+        async_add_entities([MockEntity(name="slow entity", unique_id=None)])
+
+    mock_integration(hass, MockModule(domain))
+    mock_platform(
+        hass,
+        f"{domain}.{DOMAIN}",
+        MockPlatform(async_setup_platform=async_platform_setup),
+    )
+    component = EntityComponent(_LOGGER, DOMAIN, hass)
+    await component.async_setup({DOMAIN: {"platform": domain}})
+    await started.wait()
+
+    cluster.async_set_leader(hass, False)
+    await asyncio.sleep(0)
+    # The setup that passed the leadership check is still running here.
+    assert cluster.async_transitions_pending(hass)
+    resume.set()
+    await cluster.async_wait_transitions(hass)
+
+    assert hass.states.get("test_domain.slow_entity") is None
+    assert component._platforms.keys() == {DOMAIN}
+    assert len(component._leader_only.deferred) == 1

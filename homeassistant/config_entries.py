@@ -21,7 +21,16 @@ from functools import cache
 import logging
 from random import randint
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Self, TypedDict, cast, override
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NamedTuple,
+    Protocol,
+    Self,
+    TypedDict,
+    cast,
+    override,
+)
 
 from async_interrupt import interrupt
 import probatio
@@ -53,6 +62,7 @@ from .exceptions import (
     HomeAssistantError,
 )
 from .helpers import (
+    cluster,
     device_registry as dr,
     entity_registry as er,
     issue_registry as ir,
@@ -752,6 +762,31 @@ class ConfigEntry[_DataT = Any]:
         if self.source == SOURCE_IGNORE or self.disabled_by:
             return
 
+        # A forward to a platform (integration is another domain) is part of
+        # a setup that was already placed. A setup that is not allowed (the
+        # entry is already set up, or the setup lock is not held) is refused
+        # below without consulting the placement, which could otherwise mark
+        # a running entry as not loaded.
+        if (
+            (placement := hass.config_entries.async_get_placement()) is not None
+            and (integration is None or integration.domain == self.domain)
+            and self.state
+            not in (ConfigEntryState.LOADED, ConfigEntryState.SETUP_IN_PROGRESS)
+            and self.setup_lock.locked()
+        ):
+            try:
+                standby_reason = await placement.async_place_entry(self)
+            except Exception:
+                # Fail closed: running an entry the placement could not
+                # account for may run it on two instances at once.
+                _LOGGER.exception(
+                    "Config entry placement failed for %s (%s)", self.title, self.domain
+                )
+                standby_reason = "Config entry placement failed"
+            if standby_reason is not None:
+                self._async_set_state(hass, ConfigEntryState.NOT_LOADED, standby_reason)
+                return
+
         current_entry.set(self)
         try:
             await self.__async_setup_with_context(hass, integration)
@@ -1246,6 +1281,9 @@ class ConfigEntry[_DataT = Any]:
             )
             # Restore modified_at
             object.__setattr__(self, "modified_at", old_modified_at)
+            cluster.async_record_failure(
+                hass, f"clean-up of config entry {self.entry_id} ({self.title}) failed"
+            )
 
     @callback
     def _async_set_state(
@@ -1578,6 +1616,54 @@ current_entry: ContextVar[ConfigEntry | None] = ContextVar(
 )
 
 
+class ConfigEntryPlacement(Protocol):
+    """Decide whether a config entry runs on this instance.
+
+    Several instances that share their configuration (a cluster) must not
+    run the same config entry at the same time. The cluster package
+    registers a placement with `ConfigEntries.async_set_placement`; it is
+    consulted before every setup of an entry (startup, reload, setup retry,
+    enabling, a new entry), but not for the platforms a setup forwards to.
+    """
+
+    async def async_place_entry(self, entry: ConfigEntry) -> str | None:
+        """Return None to set up the entry here, or why it is not set up.
+
+        The entry stays in `ConfigEntryState.NOT_LOADED` with the returned
+        reason. The placement sets it up later with
+        `ConfigEntries.async_setup` once it should run here. It must not
+        raise; an exception keeps the entry unloaded.
+        """
+
+    @callback
+    def async_refuse_removal(self, entry: ConfigEntry) -> str | None:
+        """Return None if the entry may be removed here, or why it may not.
+
+        Removing an entry runs the integration's clean-up, which can revoke
+        credentials or delete resources that the instance running the entry
+        still uses. An instance that does not run it refuses the removal.
+        """
+
+    @callback
+    def async_refuse_change(self, entry: ConfigEntry, change: str) -> str | None:
+        """Return None if the entry may be changed here, or why it may not.
+
+        ``change`` names what the user asks for: "options", "reauth",
+        "reconfigure" or "disabled_by". An instance that does not run the
+        entry refuses, because the change would be reverted when the instance
+        that runs it replaces the entry's record.
+        """
+
+    async def async_before_remove(self, entry: ConfigEntry) -> None:
+        """Prepare the removal of an entry before its clean-up runs.
+
+        Called once the removal was not refused, before the entry is unloaded
+        and the integration's clean-up runs. A cluster records the removal
+        here, so that another instance completes it if this one stops before
+        it is done. Raise `OperationNotAllowed` to stop the removal.
+        """
+
+
 class FlowCancelledError(Exception):
     """Error to indicate that a flow has been cancelled."""
 
@@ -1642,6 +1728,11 @@ class ConfigEntriesFlowManager(
             raise HomeAssistantError(
                 f"Cannot initialize a {source} flow without a link to the config entry"
             )
+
+        if source in {SOURCE_REAUTH, SOURCE_RECONFIGURE} and (
+            linked := self.config_entries.async_get_entry(context["entry_id"])
+        ):
+            self.config_entries._async_check_change_allowed(linked, source)  # noqa: SLF001
 
         flow_id = ulid_util.ulid_now()
 
@@ -2284,7 +2375,62 @@ class ConfigEntries:
         self._entries = ConfigEntryItems(hass)
         self._store = ConfigEntryStore(hass)
         self._initialized = asyncio.Event()
+        self._placement: ConfigEntryPlacement | None = None
         EntityRegistryDisabledHandler(hass).async_setup()
+
+    @callback
+    def async_get_placement(self) -> ConfigEntryPlacement | None:
+        """Return the registered config entry placement, if any."""
+        return self._placement
+
+    @callback
+    def async_set_placement(self, placement: ConfigEntryPlacement) -> CALLBACK_TYPE:
+        """Register the placement that decides where config entries run.
+
+        Only one placement can be registered. Entries that are already set up
+        are not affected; register it before they set up (see bootstrap).
+        Returns a callback that removes it.
+        """
+        if self._placement is not None:
+            raise HomeAssistantError("A config entry placement is already registered")
+        self._placement = placement
+
+        @callback
+        def _remove() -> None:
+            if self._placement is placement:
+                self._placement = None
+
+        return _remove
+
+    @callback
+    def _async_check_change_allowed(self, entry: ConfigEntry, change: str) -> None:
+        """Raise `OperationNotAllowed` if a registered placement refuses the change."""
+        if (placement := self._placement) is not None and (
+            reason := placement.async_refuse_change(entry, change)
+        ) is not None:
+            raise OperationNotAllowed(
+                f"The config entry '{entry.title}' ({entry.domain}) with entry_id"
+                f" '{entry.entry_id}' cannot be changed here ({change}): {reason}"
+            )
+
+    @callback
+    def _async_set_standby(self, entry_id: str, reason: str) -> None:
+        """Record why a config entry that is not loaded runs elsewhere.
+
+        Internal: for the registered placement (the cluster) only; integrations
+        must not call it. For a placement that unloaded an entry because it
+        moved to another instance. The entry must be in
+        `ConfigEntryState.NOT_LOADED`.
+        """
+        entry = self.async_get_known_entry(entry_id)
+        if entry.state is not ConfigEntryState.NOT_LOADED:
+            raise OperationNotAllowed(
+                f"The config entry '{entry.title}' ({entry.domain}) with entry_id"
+                f" '{entry.entry_id}' cannot be put on standby because it is in"
+                f" state {entry.state}, but needs to be in the"
+                f" {ConfigEntryState.NOT_LOADED} state"
+            )
+        entry._async_set_state(self.hass, ConfigEntryState.NOT_LOADED, reason)  # noqa: SLF001
 
     @callback
     def async_domains(
@@ -2389,8 +2535,27 @@ class ConfigEntries:
         self._async_schedule_save()
 
     async def async_remove(self, entry_id: str) -> dict[str, Any]:
-        """Remove, unload and clean up after an entry."""
-        unload_success, entry = await self._async_remove(entry_id)
+        """Remove, unload and clean up after an entry.
+
+        A registered placement can refuse the removal; then
+        `OperationNotAllowed` is raised.
+        """
+        return await self._async_remove_and_clean_up(entry_id, replica=False)
+
+    async def _async_remove_replica(self, entry_id: str) -> dict[str, Any]:
+        """Remove an entry without calling the integration's clean-up.
+
+        Internal: for the registered placement (the cluster) only; integrations
+        must not call it, it skips the clean-up. Another instance removed the
+        entry and already ran the clean-up (cloud resources, webhooks). The
+        placement is not asked.
+        """
+        return await self._async_remove_and_clean_up(entry_id, replica=True)
+
+    async def _async_remove_and_clean_up(
+        self, entry_id: str, *, replica: bool
+    ) -> dict[str, Any]:
+        unload_success, entry = await self._async_remove(entry_id, replica=replica)
         self._async_clean_up(entry)
 
         for discovery_domain in entry.discovery_keys:
@@ -2402,9 +2567,22 @@ class ConfigEntries:
 
         return {"require_restart": not unload_success}
 
-    async def _async_remove(self, entry_id: str) -> tuple[bool, ConfigEntry]:
+    async def _async_remove(
+        self, entry_id: str, *, replica: bool = False
+    ) -> tuple[bool, ConfigEntry]:
         """Remove and unload an entry."""
         entry = self.async_get_known_entry(entry_id)
+        if (
+            not replica
+            and (placement := self._placement) is not None
+            and (reason := placement.async_refuse_removal(entry)) is not None
+        ):
+            raise OperationNotAllowed(
+                f"The config entry '{entry.title}' ({entry.domain}) with entry_id"
+                f" '{entry.entry_id}' cannot be removed here: {reason}"
+            )
+        if not replica and (placement := self._placement) is not None:
+            await placement.async_before_remove(entry)
 
         async with entry.setup_lock:
             if not entry.state.recoverable:
@@ -2412,8 +2590,18 @@ class ConfigEntries:
             else:
                 unload_success = await self.async_unload(entry_id, _lock=False)
 
+            if not unload_success:
+                cluster.async_record_failure(
+                    self.hass,
+                    f"unloading config entry {entry.entry_id} ({entry.title}) failed",
+                )
             del self._entries[entry.entry_id]
-            await entry.async_remove(self.hass)
+            if not replica:
+                with cluster.async_track_work(
+                    self.hass,
+                    f"removal of config entry {entry.entry_id} ({entry.title})",
+                ):
+                    await entry.async_remove(self.hass)
 
             self.async_update_issues()
             self._async_schedule_save()
@@ -2706,6 +2894,7 @@ class ConfigEntries:
         if entry.disabled_by is disabled_by:
             return True
 
+        self._async_check_change_allowed(entry, "disabled_by")
         entry.disabled_by = disabled_by
         self._async_schedule_save()
         self._async_dispatch(ConfigEntryChange.UPDATED, entry)
@@ -3039,10 +3228,21 @@ class ConfigEntries:
         """Forward the setup of an entry to a different component."""
         # Setup Component if not set up yet
         if domain not in self.hass.config.components:
-            with async_pause_setup(self.hass, SetupPhases.WAIT_BASE_PLATFORM_SETUP):
-                result = await async_setup_component(
-                    self.hass, domain, self._hass_config
-                )
+            # In a cluster the base component's YAML platforms are not part
+            # of this entry: they follow the leadership, not the entry.
+            token = (
+                current_entry.set(None)
+                if cluster.async_is_clustered(self.hass)
+                else None
+            )
+            try:
+                with async_pause_setup(self.hass, SetupPhases.WAIT_BASE_PLATFORM_SETUP):
+                    result = await async_setup_component(
+                        self.hass, domain, self._hass_config
+                    )
+            finally:
+                if token is not None:
+                    current_entry.reset(token)
 
             if not result:
                 return False
@@ -4152,6 +4352,7 @@ class OptionsFlowManager(
         The entry_id and the flow.handler is the same thing to map entry with flow.
         """
         entry = self._async_get_config_entry(handler_key)
+        self.hass.config_entries._async_check_change_allowed(entry, "options")  # noqa: SLF001
         handler = await _async_get_flow_handler(self.hass, entry.domain, {})
         return handler.async_get_options_flow(entry)
 

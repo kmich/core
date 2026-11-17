@@ -1,0 +1,57 @@
+# Two-node cluster harness: two real Home Assistant processes from this
+# checkout, one NATS server.
+#
+#   ./harness/up.sh          # fresh configs + start (the fixture does the same)
+#   docker compose -f harness/docker-compose.yml down -v
+#
+# Nodes run `python -m homeassistant` from the repository mounted read-only at
+# /src, in the Home Assistant test image (no build, no PyPI access needed).
+# Only NATS is published, on 127.0.0.1:14222 (monitoring on 127.0.0.1:18222):
+# the tests observe and drive the cluster through NATS alone.
+#
+# Single NATS server = single point of failure; fine for testing failover of
+# HA nodes, not for production (use a 3-node NATS cluster and replicas: 3).
+name: hass-cluster
+
+x-node: &node
+  image: ha-core-test:2026.11.2-full
+  working_dir: /src
+  command:
+    ["python", "-m", "homeassistant", "--config", "/config", "--skip-pip"]
+  depends_on: [nats]
+  networks: [cluster]
+  restart: "no"
+
+services:
+  nats:
+    image: nats:2.15.3-alpine
+    command: ["-js", "-m", "8222", "--store_dir", "/data"]
+    ports:
+      - "127.0.0.1:14222:4222"
+      - "127.0.0.1:18222:8222"
+    networks: [cluster]
+
+  node_a:
+    <<: *node
+    hostname: node-a
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      CLUSTER_NODE_ID: node_a
+    volumes:
+      - ../../..:/src:ro
+      - ./runtime/node_a:/config
+
+  node_b:
+    <<: *node
+    hostname: node-b
+    environment:
+      TZ: UTC
+      PYTHONDONTWRITEBYTECODE: "1"
+      CLUSTER_NODE_ID: node_b
+    volumes:
+      - ../../..:/src:ro
+      - ./runtime/node_b:/config
+
+networks:
+  cluster: {}

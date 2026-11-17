@@ -3720,3 +3720,51 @@ async def test_async_set_updates_last_reported(hass: HomeAssistant) -> None:
         assert state.last_reported_timestamp != last_reported_timestamp
         last_reported = state.last_reported
         last_reported_timestamp = state.last_reported_timestamp
+
+
+class _RecordingRouter:
+    """Service call router that records calls and executes them locally."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.hass = hass
+        self.calls: list[tuple[str, str]] = []
+
+    async def async_route_service_call(
+        self,
+        domain: str,
+        service: str,
+        service_data: dict[str, Any] | None,
+        blocking: bool,
+        context: ha.Context | None,
+        target: dict[str, Any] | None,
+        return_response: bool,
+    ) -> ServiceResponse:
+        self.calls.append((domain, service))
+        return await self.hass.services._async_call_local(
+            domain, service, service_data, blocking, context, target, return_response
+        )
+
+
+async def test_service_call_router(hass: HomeAssistant) -> None:
+    """A registered router sees every call; _async_call_local bypasses it."""
+    calls = async_mock_service(hass, "test_domain", "test_service")
+    router = _RecordingRouter(hass)
+    remove = hass.services.async_set_router(router)
+
+    await hass.services.async_call("test_domain", "test_service", {}, blocking=True)
+    assert router.calls == [("test_domain", "test_service")]
+    assert len(calls) == 1
+
+    await hass.services._async_call_local(
+        "test_domain", "test_service", {}, blocking=True
+    )
+    assert router.calls == [("test_domain", "test_service")]
+    assert len(calls) == 2
+
+    with pytest.raises(HomeAssistantError, match="already registered"):
+        hass.services.async_set_router(_RecordingRouter(hass))
+
+    remove()
+    await hass.services.async_call("test_domain", "test_service", {}, blocking=True)
+    assert len(router.calls) == 1
+    assert len(calls) == 3

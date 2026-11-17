@@ -610,3 +610,24 @@ async def test_removed_yaml_support(hass: HomeAssistant) -> None:
 
         assert res.keys() == {"homeassistant"}
         _assert_warnings_errors(res, [], [])
+
+
+async def test_cluster_key_is_not_an_unknown_integration(hass: HomeAssistant) -> None:
+    """``cluster:`` is Core's own key: it is checked, not looked up as an integration."""
+    files = {
+        YAML_CONFIG_FILE: BASE_CONFIG
+        + "cluster:\n  node_id: node_a\n  security: permissive\n"
+    }
+    with patch("os.path.isfile", return_value=True), patch_yaml_files(files):
+        res = await async_check_ha_config_file(hass)
+    assert not res.errors, res.errors
+    assert not [w for w in res.warnings if "cluster" in w.message.lower()]
+    assert res["cluster"]["node_id"] == "node_a"
+
+
+async def test_cluster_key_with_invalid_values_is_an_error(hass: HomeAssistant) -> None:
+    """A wrong value in ``cluster:`` is reported by the check."""
+    files = {YAML_CONFIG_FILE: BASE_CONFIG + "cluster:\n  node_id: 'not valid!'\n"}
+    with patch("os.path.isfile", return_value=True), patch_yaml_files(files):
+        res = await async_check_ha_config_file(hass)
+    assert [e for e in res.errors if e.domain == "cluster"]

@@ -44,6 +44,7 @@ from homeassistant.core import (
 )
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound, TemplateError
 from homeassistant.helpers import (
+    cluster as cluster_helper,
     device_registry as dr,
     entity_registry as er,
     issue_registry as ir,
@@ -2356,3 +2357,46 @@ async def test_remove_script_entity_unloads_script(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
 
     script_unload.assert_called_once()
+
+
+async def test_standalone_script_does_not_track_leadership(
+    hass: HomeAssistant,
+) -> None:
+    """Without a cluster a script creates no cluster role and no listener."""
+    assert await async_setup_component(
+        hass, "script", {"script": {"idle": {"sequence": []}}}
+    )
+
+    assert not cluster_helper.async_is_clustered(hass)
+    assert cluster_helper.DATA_CLUSTER_ROLE not in hass.data
+
+
+async def test_script_stops_when_leadership_is_lost(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """A former cluster leader stops its script runs."""
+    cluster_helper.async_set_leader(hass, True)
+    assert await async_setup_component(
+        hass,
+        "script",
+        {
+            "script": {
+                "waiting": {
+                    "sequence": [{"delay": {"hours": 1}}, {"action": "test.script"}]
+                }
+            }
+        },
+    )
+    await hass.services.async_call("script", "turn_on", {"entity_id": "script.waiting"})
+    # Not async_block_till_done: it would wait for the delay.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert hass.states.get("script.waiting").state == "on"
+
+    cluster_helper.async_set_leader(hass, False)
+    await hass.async_block_till_done()
+    assert hass.states.get("script.waiting").state == "off"
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(hours=2))
+    await hass.async_block_till_done()
+    assert len(calls) == 0

@@ -7,6 +7,9 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, override
 
 from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.util.json import json_loads
+
+from .json import json_bytes
 
 if TYPE_CHECKING:
     from .storage import Store
@@ -79,6 +82,37 @@ class BaseRegistry[_StoreDataT: Mapping[str, Any] | Sequence[Any]](ABC):
 
     hass: HomeAssistant
     _store: Store[_StoreDataT]
+    # Data that ``async_replace`` makes ``_async_load`` use instead of the store.
+    _replacement: _StoreDataT | None = None
+
+    @callback
+    def async_dump(self) -> _StoreDataT:
+        """Return the content of the registry as plain JSON data.
+
+        The same data as the store file holds under ``data``.
+        """
+        return json_loads(json_bytes(self._data_to_save()))  # type: ignore[return-value]
+
+    async def async_replace(self, data: _StoreDataT) -> None:
+        """Replace the content of the registry with ``data``.
+
+        ``data`` is what ``async_dump`` returns, in the current storage
+        version. The registry is loaded from it as from a store file, so items
+        keep their ids; what is not in ``data`` is dropped. No event is fired.
+        For a cluster that loads the registries of the leader at takeover.
+        """
+        self._replacement = data
+        try:
+            await self._async_load()
+        finally:
+            self._replacement = None
+        self.async_schedule_save()
+
+    async def _async_load_stored(self) -> _StoreDataT | None:
+        """Return the data to load: the replacement, or else the store's."""
+        if self._replacement is not None:
+            return self._replacement
+        return await self._store.async_load()
 
     @callback
     def async_schedule_save(self) -> None:

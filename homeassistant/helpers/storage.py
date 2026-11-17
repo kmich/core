@@ -43,6 +43,9 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_SEMAPHORE: HassKey[asyncio.Semaphore] = HassKey("storage_semaphore")
 STORAGE_MANAGER: HassKey[_StoreManager] = HassKey("storage_manager")
+STORAGE_WRITE_LISTENERS: HassKey[
+    list[tuple[Callable[[str, str | bytes], None], frozenset[str]]]
+] = HassKey("storage_write_listeners")
 
 MANAGER_CLEANUP_DELAY = 60
 
@@ -84,6 +87,35 @@ async def async_migrator[_T: Mapping[str, Any] | Sequence[Any]](
     await store.async_save(config)
     await hass.async_add_executor_job(os.remove, old_path)
     return config
+
+
+@callback
+def async_track_store_writes(
+    hass: HomeAssistant,
+    listener: Callable[[str, str | bytes], None],
+    keys: Iterable[str],
+) -> CALLBACK_TYPE:
+    """Call ``listener`` after one of the stores ``keys`` was written to disk.
+
+    Internal: for the cluster, which replicates storage. The listener receives
+    the store key and the whole content as written, so only the stores it is
+    meant to see are named; ask for nothing else. It is called in the event loop
+    and must not do I/O itself; schedule a task for that.
+
+    Private stores (``private=True``: credentials, tokens, keys) are never
+    passed to listeners, whatever ``keys`` says.
+    Returns a callback that removes the listener.
+    """
+    registration = (listener, frozenset(keys))
+    listeners = hass.data.setdefault(STORAGE_WRITE_LISTENERS, [])
+    listeners.append(registration)
+
+    @callback
+    def _remove() -> None:
+        with suppress(ValueError):
+            listeners.remove(registration)
+
+    return _remove
 
 
 def get_internal_store_manager(hass: HomeAssistant) -> _StoreManager:
@@ -331,6 +363,7 @@ class Store[_T: Mapping[str, Any] | Sequence[Any]]:
         self.minor_version = minor_version
         self.key = key
         self.hass = hass
+        self._private = private
         self._io = _FileStoreIO(hass, key, self.path, private, atomic_writes)
         self._data: dict[str, Any] | None = None
         self._delay_handle: asyncio.TimerHandle | None = None
@@ -650,6 +683,16 @@ class Store[_T: Mapping[str, Any] | Sequence[Any]]:
             )
         _LOGGER.debug("Writing data for %s to %s", self.key, self.path)
         await self._io.async_write(mode, json_data)
+        if not self._private and (
+            listeners := self.hass.data.get(STORAGE_WRITE_LISTENERS)
+        ):
+            for listener, keys in listeners.copy():
+                if self.key not in keys:
+                    continue
+                try:
+                    listener(self.key, json_data)
+                except Exception:
+                    _LOGGER.exception("Error in store write listener for %s", self.key)
 
     def _prepare_data(self, data: dict) -> tuple[str, str | bytes]:
         """Serialize data for the I/O implementation."""

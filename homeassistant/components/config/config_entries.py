@@ -125,6 +125,8 @@ class ConfigManagerEntryResourceView(HomeAssistantView):
             result = await shield(remove_task)
         except config_entries.UnknownEntry:
             return self.json_message("Invalid entry specified", HTTPStatus.NOT_FOUND)
+        except config_entries.OperationNotAllowed as err:
+            return self.json_message(str(err), HTTPStatus.CONFLICT)
 
         return self.json(result)
 

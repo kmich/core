@@ -7,9 +7,11 @@
 # --- Only for core file! ---
 homeassistant.auth.auth_store
 homeassistant.auth.providers.*
+homeassistant.cluster.*
 homeassistant.core
 homeassistant.exceptions
 homeassistant.helpers.area_registry
+homeassistant.helpers.cluster
 homeassistant.helpers.condition
 homeassistant.helpers.debounce
 homeassistant.helpers.deprecation

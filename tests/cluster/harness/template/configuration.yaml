@@ -1,0 +1,29 @@
+# Shared by both harness nodes; the node id comes from the container env.
+homeassistant:
+  name: Cluster harness
+  latitude: 37.98
+  longitude: 23.72
+  elevation: 0
+  unit_system: metric
+  time_zone: UTC
+  country: GR
+
+http:
+
+logger:
+  default: warning
+  logs:
+    homeassistant.cluster: debug
+
+# A YAML entity: it runs on every node (see "Known limitations").
+input_boolean:
+  cluster_probe:
+    name: Cluster probe
+
+cluster:
+  node_id: !env_var CLUSTER_NODE_ID
+  nats_url: nats://nats:4222
+  # The harness NATS server has no users.
+  security: permissive
+  lease_ttl: 3
+  renew_interval: 1

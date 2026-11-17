@@ -1096,6 +1096,29 @@ async def test_remove_entry_if_not_loaded(
     assert len(mock_unload_entry.mock_calls) == 0
 
 
+@pytest.mark.parametrize(
+    ("method", "cleanups"),
+    [("async_remove", 1), ("_async_remove_replica", 0)],
+)
+async def test_remove_entry_replica_skips_the_integration_clean_up(
+    hass: HomeAssistant,
+    manager: config_entries.ConfigEntries,
+    method: str,
+    cleanups: int,
+) -> None:
+    """Test that a replica removal does not call async_remove_entry."""
+    mock_remove_entry = AsyncMock(return_value=None)
+    mock_integration(hass, MockModule("comp", async_remove_entry=mock_remove_entry))
+    MockConfigEntry(domain="comp", entry_id="test1").add_to_manager(manager)
+    MockConfigEntry(domain="comp", entry_id="test2").add_to_manager(manager)
+
+    result = await getattr(manager, method)("test1")
+
+    assert result == {"require_restart": False}
+    assert manager.async_entry_ids() == ["test2"]
+    assert len(mock_remove_entry.mock_calls) == cleanups
+
+
 async def test_remove_entry_if_integration_deleted(
     hass: HomeAssistant, manager: config_entries.ConfigEntries
 ) -> None:
@@ -12334,3 +12357,244 @@ async def test_remove_subentry_cleans_registries_before_update_listener(
     assert hass.config_entries.async_remove_subentry(entry, "removed")
     await hass.async_block_till_done()
     assert observed == [(False, False, False)]
+
+
+class _RecordingPlacement:
+    """Config entry placement that records entries and returns a fixed answer."""
+
+    def __init__(
+        self, reason: str | None = None, error: Exception | None = None
+    ) -> None:
+        self.reason = reason
+        self.error = error
+        self.placed: list[str] = []
+        self.refuse_removal: str | None = None
+        self.refuse_change: str | None = None
+        self.changes_asked: list[tuple[str, str]] = []
+        self.before_remove: list[str] = []
+        self.before_remove_error: Exception | None = None
+
+    async def async_place_entry(self, entry: ConfigEntry) -> str | None:
+        self.placed.append(entry.entry_id)
+        if self.error is not None:
+            raise self.error
+        return self.reason
+
+    @callback
+    def async_refuse_removal(self, entry: ConfigEntry) -> str | None:
+        return self.refuse_removal
+
+    @callback
+    def async_refuse_change(self, entry: ConfigEntry, change: str) -> str | None:
+        self.changes_asked.append((entry.entry_id, change))
+        return self.refuse_change
+
+    async def async_before_remove(self, entry: ConfigEntry) -> None:
+        self.before_remove.append(entry.entry_id)
+        if self.before_remove_error is not None:
+            raise self.before_remove_error
+
+
+async def test_placement_refuses_removal(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """An instance that does not run an entry does not run its clean-up."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_remove_entry = AsyncMock(return_value=None)
+    mock_integration(hass, MockModule("comp", async_remove_entry=mock_remove_entry))
+    mock_platform(hass, "comp.config_flow", None)
+    placement = _RecordingPlacement("Running on node b")
+    placement.refuse_removal = "it runs on node b"
+    manager.async_set_placement(placement)
+
+    with pytest.raises(config_entries.OperationNotAllowed, match="runs on node b"):
+        await manager.async_remove(entry.entry_id)
+    assert manager.async_get_entry(entry.entry_id) is entry
+    assert len(mock_remove_entry.mock_calls) == 0
+
+    # A replica removal (the leader removed it and ran the clean-up) is fine.
+    await manager._async_remove_replica(entry.entry_id)
+    assert manager.async_get_entry(entry.entry_id) is None
+    assert len(mock_remove_entry.mock_calls) == 0
+    assert placement.before_remove == []
+
+
+async def test_placement_refuses_changes(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """Options, reauth, reconfigure and disabling are refused, unchanged."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_integration(hass, MockModule("comp"))
+    mock_platform(hass, "comp.config_flow", None)
+    placement = _RecordingPlacement()
+    placement.refuse_change = "it runs on node b"
+    manager.async_set_placement(placement)
+
+    with pytest.raises(config_entries.OperationNotAllowed, match="runs on node b"):
+        await manager.options.async_init(entry.entry_id)
+    for source in (config_entries.SOURCE_REAUTH, config_entries.SOURCE_RECONFIGURE):
+        with pytest.raises(config_entries.OperationNotAllowed, match="runs on node b"):
+            await manager.flow.async_init(
+                "comp", context={"source": source, "entry_id": entry.entry_id}
+            )
+    with pytest.raises(config_entries.OperationNotAllowed, match="runs on node b"):
+        await manager.async_set_disabled_by(
+            entry.entry_id, config_entries.ConfigEntryDisabler.USER
+        )
+    assert entry.disabled_by is None
+    assert [change for _, change in placement.changes_asked] == [
+        "options",
+        "reauth",
+        "reconfigure",
+        "disabled_by",
+    ]
+
+    # Setting what is already set asks nobody; allowing the change lets it through.
+    placement.changes_asked.clear()
+    assert await manager.async_set_disabled_by(entry.entry_id, None)
+    assert placement.changes_asked == []
+    placement.refuse_change = None
+    await manager.async_set_disabled_by(
+        entry.entry_id, config_entries.ConfigEntryDisabler.USER
+    )
+    assert entry.disabled_by is config_entries.ConfigEntryDisabler.USER
+
+
+async def test_placement_prepares_removal(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """The placement records a removal before the clean-up, and can stop it."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_remove_entry = AsyncMock(return_value=None)
+    mock_integration(hass, MockModule("comp", async_remove_entry=mock_remove_entry))
+    mock_platform(hass, "comp.config_flow", None)
+    placement = _RecordingPlacement()
+    placement.before_remove_error = config_entries.OperationNotAllowed("try again")
+    manager.async_set_placement(placement)
+
+    with pytest.raises(config_entries.OperationNotAllowed, match="try again"):
+        await manager.async_remove(entry.entry_id)
+    assert manager.async_get_entry(entry.entry_id) is entry
+    assert len(mock_remove_entry.mock_calls) == 0
+
+    placement.before_remove_error = None
+    await manager.async_remove(entry.entry_id)
+    assert placement.before_remove == [entry.entry_id, entry.entry_id]
+    assert manager.async_get_entry(entry.entry_id) is None
+    assert len(mock_remove_entry.mock_calls) == 1
+
+
+async def test_placement_keeps_entry_unloaded(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """A placement that answers with a reason keeps the entry unloaded."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_setup_entry = AsyncMock(return_value=None)
+    mock_integration(hass, MockModule("comp", async_setup_entry=mock_setup_entry))
+    mock_platform(hass, "comp.config_flow", None)
+    placement = _RecordingPlacement("Running on node b")
+    remove = manager.async_set_placement(placement)
+
+    assert not await manager.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.NOT_LOADED
+    assert entry.reason == "Running on node b"
+    assert placement.placed == [entry.entry_id]
+    assert len(mock_setup_entry.mock_calls) == 0
+
+    placement.reason = None
+    assert await manager.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.LOADED
+    assert placement.placed == [entry.entry_id, entry.entry_id]
+
+    remove()
+    assert manager.async_get_placement() is None
+
+
+async def test_placement_not_consulted_for_platform_forwards(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """Forwarding to platforms is part of a setup that was already placed."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+
+    async def mock_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        await hass.config_entries.async_forward_entry_setups(entry, ["light"])
+
+    mock_integration(hass, MockModule("comp", async_setup_entry=mock_setup_entry))
+    mock_platform(hass, "comp.config_flow", None)
+    mock_platform(hass, "comp.light", MockPlatform(async_setup_entry=AsyncMock()))
+    placement = _RecordingPlacement()
+    manager.async_set_placement(placement)
+
+    assert await manager.async_setup(entry.entry_id)
+    assert placement.placed == [entry.entry_id]
+
+
+async def test_placement_error_fails_closed(
+    hass: HomeAssistant,
+    manager: config_entries.ConfigEntries,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An entry the placement could not decide on is not set up."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_setup_entry = AsyncMock(return_value=None)
+    mock_integration(hass, MockModule("comp", async_setup_entry=mock_setup_entry))
+    mock_platform(hass, "comp.config_flow", None)
+    manager.async_set_placement(_RecordingPlacement(error=RuntimeError("boom")))
+
+    assert not await manager.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.NOT_LOADED
+    assert entry.reason == "Config entry placement failed"
+    assert len(mock_setup_entry.mock_calls) == 0
+    assert "Config entry placement failed for" in caplog.text
+
+
+async def test_placement_not_consulted_for_refused_setup(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """A setup Core refuses must not let the placement change a running entry."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    mock_integration(
+        hass, MockModule("comp", async_setup_entry=AsyncMock(return_value=None))
+    )
+    mock_platform(hass, "comp.config_flow", None)
+    assert await manager.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.LOADED
+    placement = _RecordingPlacement("Running on node b")
+    manager.async_set_placement(placement)
+
+    async with entry.setup_lock:
+        with pytest.raises(config_entries.OperationNotAllowed):
+            await entry.async_setup(hass)
+    with pytest.raises(config_entries.OperationNotAllowed):
+        await entry.async_setup(hass)  # without the setup lock
+    assert entry.state is config_entries.ConfigEntryState.LOADED
+    assert placement.placed == []
+
+
+async def test_only_one_placement(manager: config_entries.ConfigEntries) -> None:
+    """A second placement is refused."""
+    manager.async_set_placement(_RecordingPlacement())
+    with pytest.raises(HomeAssistantError, match="already registered"):
+        manager.async_set_placement(_RecordingPlacement())
+
+
+async def test_set_standby(
+    hass: HomeAssistant, manager: config_entries.ConfigEntries
+) -> None:
+    """A placement records why an unloaded entry runs elsewhere."""
+    entry = MockConfigEntry(domain="comp")
+    entry.add_to_hass(hass)
+    manager._async_set_standby(entry.entry_id, "Running on node b")
+    assert entry.state is config_entries.ConfigEntryState.NOT_LOADED
+    assert entry.reason == "Running on node b"
+
+    entry.mock_state(hass, config_entries.ConfigEntryState.LOADED)
+    with pytest.raises(config_entries.OperationNotAllowed):
+        manager._async_set_standby(entry.entry_id, "Running on node b")

@@ -2387,7 +2387,7 @@ class EntityRegistry(BaseRegistry):
     @override
     async def _async_load(self) -> None:
         """Load the entity registry."""
-        if self._loaded_event.is_set():
+        if self._replacement is None and self._loaded_event.is_set():
             raise RuntimeError("Entity registry is already loaded")
 
         # Device registry must be loaded before entity registry because
@@ -2397,11 +2397,12 @@ class EntityRegistry(BaseRegistry):
         device_registry = dr.async_get(self.hass)
         await device_registry.async_wait_loaded()
 
-        _async_setup_cleanup(self.hass, self)
-        _async_setup_entity_restore(self.hass, self)
-        _async_setup_own_area_without_own_name_issues(self.hass, self)
+        if self._replacement is None:
+            _async_setup_cleanup(self.hass, self)
+            _async_setup_entity_restore(self.hass, self)
+            _async_setup_own_area_without_own_name_issues(self.hass, self)
 
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
         entities = EntityRegistryItems(self.hass)
         deleted_entities: dict[tuple[str, str, str], DeletedRegistryEntry] = {}
         settings = EntityRegistrySettings()

@@ -88,6 +88,10 @@ dependencies = [
   "zeroconf==0.152.0",
 ]
 
+[project.optional-dependencies]
+# Needed only by a cluster (the `cluster:` configuration key).
+cluster = ["nats-py[nkeys]==2.16.0"]
+
 [project.urls]
 "Homepage" = "https://www.home-assistant.io/"
 "Source Code" = "https://github.com/home-assistant/core"
@@ -450,6 +454,9 @@ pythonpath = ["packages/pylint-home-assistant"]
 # httpx2 (see homeassistant/__init__.py). Tests use respx directly instead.
 addopts = "-p no:respx"
 testpaths = ["tests"]
+markers = [
+  "e2e: end-to-end multi-container cluster tests",
+]
 norecursedirs = [".git", "testing_config"]
 log_format = "%(asctime)s.%(msecs)03d %(levelname)-8s %(threadName)s %(name)s:%(filename)s:%(lineno)s %(message)s"
 log_date_format = "%Y-%m-%d %H:%M:%S"

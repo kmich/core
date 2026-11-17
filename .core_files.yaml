@@ -3,6 +3,7 @@
 core: &core
   - homeassistant/*.py
   - homeassistant/auth/**
+  - homeassistant/cluster/**
   - homeassistant/helpers/**
   - homeassistant/package_constraints.txt
   - homeassistant/util/**

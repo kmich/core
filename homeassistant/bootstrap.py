@@ -11,6 +11,7 @@ import mimetypes
 from operator import contains, itemgetter
 import os
 import platform
+import re
 import sys
 import threading
 from time import monotonic
@@ -74,6 +75,7 @@ from .exceptions import HomeAssistantError, UnsupportedStorageVersionError
 from .helpers import (
     area_registry,
     category_registry,
+    cluster,
     condition,
     config_validation as cv,
     device_registry,
@@ -142,6 +144,11 @@ LOG_FILE_DISABLED_REASON_SUPERVISOR = "supervisor"
 
 # hass.data key for logging information.
 DATA_REGISTRIES_LOADED: HassKey[None] = HassKey("bootstrap_registries_loaded")
+# Top-level configuration key of the cluster (see `homeassistant/cluster`).
+CLUSTER_CONFIG_KEY = cluster.CLUSTER_CONFIG_KEY
+_CLUSTER_KEY_LINE = re.compile(r"^cluster\s*:", re.MULTILINE)
+# Set on a recovery mode instance whose configuration has a cluster.
+DATA_RECOVERY_IN_CLUSTER: HassKey[bool] = HassKey("bootstrap_recovery_in_cluster")
 
 LOG_SLOW_STARTUP_INTERVAL = 60
 SLOW_STARTUP_CHECK_INTERVAL = 1
@@ -355,8 +362,8 @@ async def async_setup_hass(
     block_async_io.enable()
     block_shared_serial.enable()
 
+    config_dict: dict[str, Any] | None = None
     if not (recovery_mode := runtime_config.recovery_mode):
-        config_dict = None
         basic_setup_success = False
 
         if previous_version := await hass.async_add_executor_job(
@@ -421,12 +428,54 @@ async def async_setup_hass(
         _LOGGER.info("Starting in recovery mode")
         hass.config.recovery_mode = True
 
+        if await _async_is_cluster_member(hass, config_dict):
+            # Recovery mode does not set up the cluster; config entries that
+            # another cluster instance may run must not start here (from the
+            # UI, for example).
+            hass.data[DATA_RECOVERY_IN_CLUSTER] = True
+
         await async_from_config_dict({"recovery_mode": {}}, hass)
 
     if runtime_config.open_ui:
         hass.add_job(open_hass_ui, hass)
 
     return hass
+
+
+async def _async_is_cluster_member(
+    hass: core.HomeAssistant, config_dict: dict[str, Any] | None
+) -> bool:
+    """Return True if this instance is a member of a cluster.
+
+    The configuration says so if it can be read, also when recovery mode was
+    asked for explicitly. A member that started before left a marker. With
+    neither (an unreadable configuration on a node that never ran as a
+    member) there is no evidence, and the instance is taken as stand-alone.
+    """
+    if config_dict is None:
+        try:
+            config_dict = await conf_util.async_hass_config_yaml(hass)
+        except HomeAssistantError, OSError:
+            config_dict = None
+    if config_dict is not None:
+        return CLUSTER_CONFIG_KEY in config_dict
+    if await cluster.async_has_membership_marker(hass):
+        return True
+    # The configuration cannot be parsed and no earlier start left a marker (a
+    # first start): look for the key in the text, as running entries that
+    # another member runs is worse than staying unloaded.
+    return await hass.async_add_executor_job(
+        _config_text_names_cluster, hass.config.path(conf_util.YAML_CONFIG_FILE)
+    )
+
+
+def _config_text_names_cluster(path: str) -> bool:
+    """Return True if the file has a top-level ``cluster:`` line."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as file:
+            return _CLUSTER_KEY_LINE.search(file.read()) is not None
+    except OSError:
+        return False
 
 
 def open_hass_ui(hass: core.HomeAssistant) -> None:
@@ -523,6 +572,62 @@ async def async_load_base_functionality(hass: core.HomeAssistant) -> bool:
     return True
 
 
+async def _async_setup_cluster(
+    hass: core.HomeAssistant, config: ConfigType
+) -> ConfigType:
+    """Set up the cluster before any integration; return the config without it.
+
+    A cluster decides which instance runs each config entry. It is not an
+    integration. If it cannot be set up, the fail-closed placement stays.
+    """
+    if CLUSTER_CONFIG_KEY not in config:
+        # A configuration that was read and has no cluster: this instance left
+        # it, and an unreadable configuration later says nothing about one.
+        # Recovery mode starts with a stub configuration without the key (the
+        # real one could not be read, or was left for repair): that says nothing
+        # about the membership either, and the marker must survive it.
+        if not hass.config.recovery_mode:
+            await cluster.async_clear_membership_marker(hass)
+        cluster.async_clear_setup_failed(hass)
+        return config
+    # Before anything can fail: recovery mode finds the membership here when
+    # the configuration cannot be read.
+    await cluster.async_save_membership_marker(hass)
+    # The NATS client is no requirement of any integration, so it is installed
+    # here, like an integration's requirements are (not with ``skip_pip``).
+    try:
+        if not hass.config.skip_pip:
+            await requirements.async_process_requirements(
+                hass, CLUSTER_CONFIG_KEY, list(cluster.CLUSTER_REQUIREMENTS)
+            )
+    except requirements.RequirementsNotFound as err:
+        _LOGGER.error(
+            "Could not install the packages the cluster needs (%s); config"
+            " entries that run on one cluster instance at a time stay unloaded",
+            err,
+        )
+        cluster.async_report_setup_failed(
+            hass, f"the packages it needs could not be installed ({err})"
+        )
+        return {k: v for k, v in config.items() if k != CLUSTER_CONFIG_KEY}
+    try:
+        from .cluster import async_setup_cluster  # noqa: PLC0415
+    except ImportError as err:
+        _LOGGER.error(
+            "The cluster needs the optional package nats-py (%s); config"
+            " entries that run on one cluster instance at a time stay unloaded",
+            err,
+        )
+        cluster.async_report_setup_failed(
+            hass, f"the package nats-py cannot be imported ({err})"
+        )
+    else:
+        # Reports its own failure (invalid configuration) with the reason.
+        if await async_setup_cluster(hass, config[CLUSTER_CONFIG_KEY]):
+            cluster.async_clear_setup_failed(hass)
+    return {k: v for k, v in config.items() if k != CLUSTER_CONFIG_KEY}
+
+
 async def async_from_config_dict(
     config: ConfigType, hass: core.HomeAssistant
 ) -> core.HomeAssistant | None:
@@ -534,6 +639,12 @@ async def async_from_config_dict(
     start = monotonic()
 
     hass.config_entries = config_entries.ConfigEntries(hass, config)
+    if hass.data.pop(DATA_RECOVERY_IN_CLUSTER, False) or CLUSTER_CONFIG_KEY in config:
+        # Before any integration is resolved or set up: a configured cluster
+        # member must not run config entries that another member may run,
+        # even if the cluster integration cannot be loaded or set up. The
+        # cluster integration replaces this placement once it took over.
+        cluster.async_install_fail_closed(hass)
     # Prime custom component cache early so we know if registry entries are tied
     # to a custom integration
     await loader.async_get_custom_components(hass)
@@ -574,6 +685,8 @@ async def async_from_config_dict(
             "Home Assistant core failed to initialize. Further initialization aborted"
         )
         return None
+
+    config = await _async_setup_cluster(hass, config)
 
     await _async_set_up_integrations(hass, config)
 
@@ -981,6 +1094,13 @@ async def _async_set_up_integrations(
                 name,
                 hass._active_tasks,  # noqa: SLF001
             )
+
+    if cluster.DATA_FAIL_CLOSED in hass.data and not hass.config.recovery_mode:
+        _LOGGER.error(
+            "The cluster is configured but could not be set up;"
+            " config entries that run on one cluster instance at a time stay"
+            " unloaded"
+        )
 
     # Wrap up startup
     _LOGGER.debug("Waiting for startup to wrap up")

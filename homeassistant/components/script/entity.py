@@ -30,6 +30,13 @@ from homeassistant.core import (
     SupportsResponse,
     callback,
 )
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.cluster import (
+    async_add_transition_task,
+    async_is_clustered,
+    async_is_leader,
+    async_track_leadership,
+)
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.issue_registry import (
     IssueSeverity,
@@ -356,6 +363,12 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
         self, variables: dict[str, Any] | None, context: Context, wait: bool
     ) -> ServiceResponse:
         """Start the run of a script."""
+        if not async_is_leader(self.hass):
+            # In a cluster only the leader runs scripts. Calls are routed to
+            # it; this covers a call that was not (no router installed).
+            raise HomeAssistantError(
+                f"Cannot run {self.entity_id}: this instance is not the cluster leader"
+            )
         self.async_set_context(context)
         coro = self._async_run(variables, context)
         if wait:
@@ -456,6 +469,10 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
             CONF_FIELDS: self.fields,
         }
         async_set_service_schema(hass, DOMAIN, unique_id, service_desc)
+        if async_is_clustered(hass):
+            self.async_on_remove(
+                async_track_leadership(hass, self._async_leadership_changed)
+            )
 
         if (state := await self.async_get_last_state()) and (
             last_triggered := state.attributes.get(
@@ -463,6 +480,18 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
             )
         ):
             self.script.last_triggered = parse_datetime(last_triggered)
+
+    @callback
+    def _async_leadership_changed(self, leader: bool) -> None:
+        """Stop the runs of a former cluster leader; the new leader acts now."""
+        if not leader and self.script.is_running:
+            async_add_transition_task(
+                self.hass,
+                self.hass.async_create_task(
+                    self.script.async_stop(),
+                    f"script {self.entity_id} stop, no longer cluster leader",
+                ),
+            )
 
     @override
     async def async_will_remove_from_hass(self) -> None:

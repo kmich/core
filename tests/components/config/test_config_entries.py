@@ -276,6 +276,21 @@ async def test_remove_entry(hass: HomeAssistant, client: TestClient) -> None:
     assert len(hass.config_entries.async_entries()) == 0
 
 
+async def test_remove_entry_refused(hass: HomeAssistant, client: TestClient) -> None:
+    """A removal the instance must not do (a cluster standby) is a conflict."""
+    entry = MockConfigEntry(domain="test")
+    entry.add_to_hass(hass)
+    with patch.object(
+        hass.config_entries,
+        "_async_remove",
+        side_effect=core_ce.OperationNotAllowed("it runs on node b"),
+    ):
+        resp = await client.delete(f"/api/config/config_entries/entry/{entry.entry_id}")
+    assert resp.status == HTTPStatus.CONFLICT
+    assert (await resp.json())["message"] == "it runs on node b"
+    assert hass.config_entries.async_get_entry(entry.entry_id) is entry
+
+
 async def test_remove_entry_survives_client_disconnect(
     hass: HomeAssistant, hass_admin_user: MockUser
 ) -> None:

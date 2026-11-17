@@ -225,7 +225,7 @@ class LabelRegistry(BaseRegistry[LabelRegistryStoreData]):
     @override
     async def _async_load(self) -> None:
         """Load the label registry."""
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
         labels = NormalizedNameBaseRegistryItems[LabelEntry]()
 
         if data is not None:

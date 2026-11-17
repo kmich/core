@@ -19,6 +19,8 @@ from homeassistant.const import CONF_ID
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import slugify
+from homeassistant.util.hass_dict import HassKey
+from homeassistant.util.json import json_loads
 
 from . import entity_registry
 from .entity import Entity
@@ -29,6 +31,13 @@ from .typing import ConfigType, VolDictType
 
 STORAGE_VERSION = 1
 SAVE_DELAY = 10
+
+_LOGGER = logging.getLogger(__name__)
+
+# Every loaded storage collection, by the key of its store.
+DATA_STORAGE_COLLECTIONS: HassKey[dict[str, StorageCollection[Any, Any]]] = HassKey(
+    "storage_collections"
+)
 
 CHANGE_ADDED = "added"
 CHANGE_UPDATED = "updated"
@@ -263,6 +272,7 @@ class StorageCollection[_ItemT, _StoreT: SerializedStorageCollection](
 
     async def async_load(self) -> None:
         """Load the storage Manager."""
+        self.hass.data.setdefault(DATA_STORAGE_COLLECTIONS, {})[self.store.key] = self
         if not (raw_storage := await self._async_load_data()):
             return
 
@@ -364,6 +374,49 @@ class StorageCollection[_ItemT, _StoreT: SerializedStorageCollection](
         await self.notify_changes([CollectionChange(CHANGE_REMOVED, item_id, item)])
 
     @callback
+    def async_dump(self) -> SerializedStorageCollection:
+        """Return the items in their storage form, as plain JSON data."""
+        return json_loads(json_bytes(self._base_data_to_save()))  # type: ignore[return-value]
+
+    async def async_replace(self, data: SerializedStorageCollection) -> None:
+        """Replace the items with those of ``data``, keeping their ids.
+
+        ``data`` is what ``async_dump`` returns, for example on another
+        instance of a cluster. Items not in ``data`` are removed, new ones are
+        added and changed ones replaced; the listeners are told about these
+        changes only. The items are not validated, as in ``async_load``. A new
+        item whose id another collection of the ID manager uses is skipped.
+        """
+        new_items = {item[CONF_ID]: item for item in data["items"]}
+        change_set = [
+            CollectionChange(CHANGE_REMOVED, item_id, self.data.pop(item_id))
+            for item_id in [
+                item_id for item_id in self.data if item_id not in new_items
+            ]
+        ]
+        for item_id, stored in new_items.items():
+            if (current := self.data.get(item_id)) is None:
+                if self.id_manager.has_id(item_id):
+                    _LOGGER.warning("Duplicate ID '%s' detected, skipping", item_id)
+                    continue
+                change_type = CHANGE_ADDED
+            elif (
+                json_loads(json_bytes(self._serialize_item(item_id, current))) == stored
+            ):
+                continue
+            else:
+                change_type = CHANGE_UPDATED
+            item = self._deserialize_item(stored)
+            self.data[item_id] = item
+            change_set.append(
+                CollectionChange(change_type, item_id, item, self._hash_item(stored))
+            )
+        if not change_set:
+            return
+        self._async_schedule_save()
+        await self.notify_changes(change_set)
+
+    @callback
     def _async_schedule_save(self) -> None:
         """Schedule saving the collection."""
         self.store.async_delay_save(self._data_to_save, SAVE_DELAY)
@@ -386,6 +439,14 @@ class StorageCollection[_ItemT, _StoreT: SerializedStorageCollection](
     def _hash_item(self, item: dict) -> str:
         """Return a hash of the item."""
         return md5(json_bytes(item)).hexdigest()
+
+
+@callback
+def async_get_storage_collection(
+    hass: HomeAssistant, key: str
+) -> StorageCollection[Any, Any] | None:
+    """Return the loaded storage collection whose store has this key."""
+    return hass.data.get(DATA_STORAGE_COLLECTIONS, {}).get(key)
 
 
 class DictStorageCollection(StorageCollection[dict, SerializedStorageCollection]):

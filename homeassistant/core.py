@@ -34,6 +34,7 @@ from typing import (
     Final,
     Generic,
     NotRequired,
+    Protocol,
     Self,
     TypedDict,
     TypeVar,
@@ -2685,15 +2686,56 @@ class ServiceCall:
         return f"<ServiceCall {self.domain}.{self.service} (c:{self.context.id})>"
 
 
+class ServiceCallRouter(Protocol):
+    """Decide where a service call executes.
+
+    Registered by the cluster package with `ServiceRegistry.async_set_router`,
+    for instances that each run part of the configuration. Every call made
+    with `ServiceRegistry.async_call` goes to the router, which executes it
+    with `ServiceRegistry._async_call_local` on this instance, on others, or
+    both.
+    """
+
+    async def async_route_service_call(
+        self,
+        domain: str,
+        service: str,
+        service_data: dict[str, Any] | None,
+        blocking: bool,
+        context: Context | None,
+        target: dict[str, Any] | None,
+        return_response: bool,
+    ) -> ServiceResponse:
+        """Execute a service call, with the same contract as `async_call`."""
+
+
 class ServiceRegistry:
     """Offer the services over the eventbus."""
 
-    __slots__ = ("_hass", "_services")
+    __slots__ = ("_hass", "_router", "_services")
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize a service registry."""
         self._services: dict[str, dict[str, Service]] = {}
         self._hass = hass
+        self._router: ServiceCallRouter | None = None
+
+    @callback
+    def async_set_router(self, router: ServiceCallRouter) -> CALLBACK_TYPE:
+        """Route every service call through ``router``.
+
+        Only one router can be registered. Returns a callback that removes it.
+        """
+        if self._router is not None:
+            raise HomeAssistantError("A service call router is already registered")
+        self._router = router
+
+        @callback
+        def _remove() -> None:
+            if self._router is router:
+                self._router = None
+
+        return _remove
 
     @property
     def services(self) -> dict[str, dict[str, Service]]:
@@ -2944,6 +2986,46 @@ class ServiceRegistry:
         Because the service is sent as an event you are not allowed to use
         the keys ATTR_DOMAIN and ATTR_SERVICE in your service_data.
 
+        If a service call router is registered, it decides where the call
+        executes.
+
+        This method is a coroutine.
+        """
+        if (router := self._router) is not None:
+            return await router.async_route_service_call(
+                domain,
+                service,
+                service_data,
+                blocking,
+                context,
+                target,
+                return_response,
+            )
+        return await self._async_call_local(
+            domain, service, service_data, blocking, context, target, return_response
+        )
+
+    async def _async_call_local(
+        self,
+        domain: str,
+        service: str,
+        service_data: dict[str, Any] | None = None,
+        blocking: bool = False,
+        context: Context | None = None,
+        target: dict[str, Any] | None = None,
+        return_response: bool = False,
+        track: set[asyncio.Task[Any]] | None = None,
+    ) -> ServiceResponse:
+        """Call a service on this instance, bypassing any service call router.
+
+        Internal: for the registered router (the cluster) only. A call made
+        through it is not checked against the placement of the instance.
+
+        See `async_call` for the arguments. For service call routers; other
+        callers use `async_call`. ``track``: a non-blocking call returns at
+        once; the task that runs the service is added to this set until it ends,
+        so that the router knows the service is still running.
+
         This method is a coroutine.
         """
         context = context or Context()
@@ -3019,11 +3101,14 @@ class ServiceRegistry:
 
         coro = self._execute_service(handler, service_call)
         if not blocking:
-            self._hass.async_create_task_internal(
+            task = self._hass.async_create_task_internal(
                 self._run_service_call_catch_exceptions(coro, service_call),
                 f"service call background {service_call.domain}.{service_call.service}",
                 eager_start=True,
             )
+            if track is not None and not task.done():
+                track.add(task)
+                task.add_done_callback(track.discard)
             return None
 
         response_data = await coro

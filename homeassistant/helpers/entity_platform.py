@@ -289,6 +289,8 @@ class EntityPlatform:
         # Storage for entities for this specific platform only
         # which are indexed by entity_id
         self.entities: dict[str, Entity] = {}
+        # Entities whose removal raised during a reset; they may still run.
+        self.failed_removals: list[str] = []
         # Whether we already warned about reaching the config entry entity limit
         self._entity_limit_warned = False
         self._tasks: list[asyncio.Task[None]] = []
@@ -1237,6 +1239,7 @@ class EntityPlatform:
                 self.logger.exception(
                     "Error while removing entity %s", entity.entity_id
                 )
+                self.failed_removals.append(entity.entity_id)
 
         self.async_unsub_polling()
         self._setup_complete = False

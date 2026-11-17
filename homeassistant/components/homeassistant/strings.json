@@ -599,6 +599,38 @@
     }
   },
   "issues": {
+    "cluster_addon_not_started": {
+      "description": "The cluster did not start the add-on {addon} on node {node}, the leader: {reason}. The cluster starts a managed add-on only on the leader, only once no other node may still run it, and only with the data of the cluster's latest snapshot of it. It keeps trying, and this repair is removed once the add-on runs.",
+      "title": "Add-on {addon} is not started on the cluster leader"
+    },
+    "cluster_cannot_take_over": {
+      "description": "This node ({node}) won the cluster leadership but could not take over, so it gave it up again: {reason}. If no other node can take over either, the cluster has no leader and automations and scripts do not run. Details are in the log. This repair is removed when a promotion on this node succeeds.",
+      "title": "Cluster node {node} cannot take over"
+    },
+    "cluster_connection_refused": {
+      "description": "This node could not use the NATS server of the cluster: {reason}. Its config entries stay on standby, and the node keeps trying, so fixing the server or the `cluster:` section is enough (a change of the section needs a restart). This repair is removed when a connection is accepted.",
+      "title": "The cluster's NATS server was refused"
+    },
+    "cluster_missing_credential": {
+      "description": "This node took over {title} ({domain}), which uses the application credential `{credential}`. Application credentials are not replicated between cluster nodes, and this node does not have it, so the integration cannot refresh its token. Add the same application credential on every cluster node.",
+      "title": "{title} has no application credential on this node"
+    },
+    "cluster_setup_failed": {
+      "description": "The cluster could not be set up on this instance: {reason}. Configuration entries that run on one cluster instance at a time stay unloaded here, so they do not run twice. Fix the cause (see the log) and restart Home Assistant.",
+      "title": "The cluster could not be set up"
+    },
+    "cluster_storage_data_lost": {
+      "description": "This node became the cluster leader, but the cluster's record of its config entries and removals is missing; the storage bucket on the NATS server was probably lost. This node kept all its config entries. If an integration was removed on another node shortly before, it may be back here: check your integrations and remove it again.",
+      "title": "Cluster data was lost"
+    },
+    "cluster_token_lost": {
+      "description": "{title} asked to be reauthenticated soon after this node took over from {previous}. Its token was probably refreshed on {previous} just before it failed, and the new token never reached this node. Reauthenticate the integration.",
+      "title": "{title} needs reauthentication after a failover"
+    },
+    "cluster_version_mismatch": {
+      "description": "The cluster nodes do not run the same Home Assistant version: {versions}. The nodes must run the same version: they replicate their configuration and states to each other, and a node of another version may read or write it differently. Update the other nodes, or stop them. Take a backup first. This repair is removed when every node runs the same version.",
+      "title": "Cluster nodes run different Home Assistant versions"
+    },
     "config_entry_only": {
       "description": "The {domain} integration does not support configuration via YAML file. You may not notice any obvious issues with the integration, but any configuration settings defined in YAML are not actually applied.\n\nTo resolve this:\n\n1. If you've not already done so, [set up the integration]({add_integration}).\n\n2. Remove `{domain}:` from your YAML configuration file.\n\n3. Restart Home Assistant.",
       "title": "The {domain} integration does not support YAML configuration"
@@ -674,6 +706,7 @@
     "integration_not_found": {
       "fix_flow": {
         "abort": {
+          "cluster_standby": "This instance is not running these configurations; remove them on the instance that does (the cluster leader).",
           "issue_ignored": "Non-existent integration {domain} ignored."
         },
         "step": {
@@ -700,6 +733,7 @@
     "orphaned_ignored_config_entry": {
       "fix_flow": {
         "abort": {
+          "cluster_standby": "This instance is not running this configuration; remove it on the instance that does (the cluster leader).",
           "issue_ignored": "Non-existent integration {domain} ignored."
         },
         "step": {

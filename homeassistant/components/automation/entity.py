@@ -30,6 +30,7 @@ from homeassistant.core import (
 )
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound, TemplateError
 from homeassistant.helpers import (
+    cluster as cluster_helper,
     condition as condition_helper,
     issue_registry as ir,
     trigger as trigger_helper,
@@ -414,6 +415,12 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         await super().async_added_to_hass()
 
         self._async_update_logger()
+        if cluster_helper.async_is_clustered(self.hass):
+            self.async_on_remove(
+                cluster_helper.async_track_leadership(
+                    self.hass, self._async_leadership_changed
+                )
+            )
 
         if state := await self.async_get_last_state():
             enable_automation = state.state == STATE_ON
@@ -473,6 +480,13 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
 
         This method is a coroutine.
         """
+        if not cluster_helper.async_is_leader(self.hass):
+            # In a cluster only the leader runs automations. Calls of
+            # automation.trigger are routed to it; this covers a call that
+            # was not (no router installed).
+            raise HomeAssistantError(
+                f"Cannot run {self.entity_id}: this instance is not the cluster leader"
+            )
         reason = ""
         alias = ""
         if "trigger" in run_variables:
@@ -688,10 +702,19 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         longer wanted.
         """
         while True:
+            # In a cluster only the leader runs automations; it attaches the
+            # triggers when it becomes the leader.
+            if not cluster_helper.async_is_leader(self.hass):
+                return
             entity_id = self.entity_id
             detach = await self._async_attach_triggers()
-            # Disabled, removed or attached by enabling again while attaching
-            if not self._is_enabled or self._async_detach_triggers is not None:
+            # Disabled, removed, no longer the cluster leader, or attached by
+            # enabling again while attaching
+            if (
+                not self._is_enabled
+                or self._async_detach_triggers is not None
+                or not cluster_helper.async_is_leader(self.hass)
+            ):
                 if detach is not None:
                     detach()
                 return
@@ -741,6 +764,37 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         # triggers listening for the started event are armed in time to catch it.
         self.hass.async_add_startup_job(HassJob(self._async_enable_automation))
 
+    @callback
+    def _async_leadership_changed(self, leader: bool) -> None:
+        """Run the automation only while this instance is the cluster leader.
+
+        A former leader stops its runs: the new leader starts its own, and two
+        instances must not act on the same trigger.
+        """
+        if leader:
+            if (
+                self._is_enabled
+                and self._async_detach_triggers is None
+                and self.hass.state is not CoreState.not_running
+            ):
+                self.hass.async_create_task(
+                    self._async_enable_automation(),
+                    f"automation {self.entity_id} attach as cluster leader",
+                )
+            return
+        if self._async_detach_triggers is not None:
+            self._async_detach_triggers()
+            self._async_detach_triggers = None
+        if self.action_script.runs:
+            cluster_helper.async_add_transition_task(
+                self.hass,
+                self.hass.async_create_task(
+                    self.action_script.async_stop(),
+                    f"automation {self.entity_id} stop, no longer cluster leader",
+                ),
+            )
+        self.async_write_ha_state()
+
     async def _async_disable(self, stop_actions: bool = DEFAULT_STOP_ACTIONS) -> None:
         """Disable the automation entity.
 
@@ -775,7 +829,7 @@ class AutomationEntity(BaseAutomationEntity, RestoreEntity):
         when the delay has passed so we need to make sure its still enabled before
         executing the action.
         """
-        if not self._is_enabled:
+        if not self._is_enabled or not cluster_helper.async_is_leader(self.hass):
             return None
         return await self.async_trigger(run_variables, context, skip_condition)
 

@@ -157,4 +157,9 @@ class HassIODiscovery(HomeAssistantView):
         for entry in self.hass.config_entries.async_entries(service):
             if entry.source != config_entries.SOURCE_HASSIO or entry.unique_id != uuid:
                 continue
-            await self.hass.config_entries.async_remove(entry.entry_id)
+            try:
+                await self.hass.config_entries.async_remove(entry.entry_id)
+            except config_entries.OperationNotAllowed:
+                # A cluster instance that does not run the entry leaves its
+                # removal to the one that does.
+                _LOGGER.debug("Not removing %s here: it runs elsewhere", entry.title)

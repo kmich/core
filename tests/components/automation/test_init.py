@@ -63,6 +63,7 @@ from homeassistant.exceptions import (
     Unauthorized,
 )
 from homeassistant.helpers import (
+    cluster as cluster_helper,
     device_registry as dr,
     entity_registry as er,
     issue_registry as ir,
@@ -5278,3 +5279,89 @@ async def test_not_triggered_trace_isolated_from_chained_run(
     child_trace = await _get_only_trace("child")
     assert child_trace["not_triggered"] is True
     assert set(child_trace["trace"]) == {"trigger/0"}
+
+
+async def test_standalone_automation_does_not_track_leadership(
+    hass: HomeAssistant,
+) -> None:
+    """Without a cluster an automation creates no cluster role and no listener."""
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation"},
+            }
+        },
+    )
+
+    assert not cluster_helper.async_is_clustered(hass)
+    assert cluster_helper.DATA_CLUSTER_ROLE not in hass.data
+
+
+async def test_automation_runs_only_on_cluster_leader(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """In a cluster, only the leader attaches triggers; the state stays on."""
+    cluster_helper.async_set_leader(hass, False)
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": {"action": "test.automation"},
+            }
+        },
+    )
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 0
+    assert hass.states.get("automation.hello").state == STATE_ON
+
+    cluster_helper.async_set_leader(hass, True)
+    await hass.async_block_till_done()
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+
+    cluster_helper.async_set_leader(hass, False)
+    await hass.async_block_till_done()
+    hass.bus.async_fire("test_event")
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert hass.states.get("automation.hello").state == STATE_ON
+
+
+async def test_automation_stops_runs_when_leadership_is_lost(
+    hass: HomeAssistant, calls: list[ServiceCall]
+) -> None:
+    """A former leader stops a run that is waiting in a delay."""
+    cluster_helper.async_set_leader(hass, True)
+    assert await async_setup_component(
+        hass,
+        automation.DOMAIN,
+        {
+            automation.DOMAIN: {
+                "alias": "hello",
+                "trigger": {"platform": "event", "event_type": "test_event"},
+                "action": [{"delay": {"hours": 1}}, {"action": "test.automation"}],
+            }
+        },
+    )
+    hass.bus.async_fire("test_event")
+    # Not async_block_till_done: it would wait for the delay.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert hass.states.get("automation.hello").attributes["current"] == 1
+
+    cluster_helper.async_set_leader(hass, False)
+    await hass.async_block_till_done()
+    assert hass.states.get("automation.hello").attributes["current"] == 0
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(hours=2))
+    await hass.async_block_till_done()
+    assert len(calls) == 0

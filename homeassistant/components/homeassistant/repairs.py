@@ -5,6 +5,7 @@ from homeassistant.components.repairs import (
     RepairsFlow,
     RepairsFlowResult,
 )
+from homeassistant.config_entries import OperationNotAllowed
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
@@ -35,7 +36,12 @@ class IntegrationNotFoundFlow(RepairsFlow):
         """Handle the confirm step of a fix flow."""
         entries = self.hass.config_entries.async_entries(self.domain)
         for entry in entries:
-            await self.hass.config_entries.async_remove(entry.entry_id)
+            try:
+                await self.hass.config_entries.async_remove(entry.entry_id)
+            except OperationNotAllowed:
+                # A cluster instance that does not run the entry (the cluster
+                # leader does) cannot remove it.
+                return self.async_abort(reason="cluster_standby")
         return self.async_create_entry(data={})
 
     async def async_step_ignore(
@@ -73,7 +79,11 @@ class OrphanedConfigEntryFlow(RepairsFlow):
         self, user_input: dict[str, str] | None = None
     ) -> RepairsFlowResult:
         """Handle the confirm step of a fix flow."""
-        await self.hass.config_entries.async_remove(self.entry_id)
+        try:
+            await self.hass.config_entries.async_remove(self.entry_id)
+        except OperationNotAllowed:
+            # See above: the instance that runs the entry has to remove it.
+            return self.async_abort(reason="cluster_standby")
         return self.async_create_entry(data={})
 
     async def async_step_ignore(

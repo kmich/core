@@ -47,7 +47,7 @@ from homeassistant.exceptions import (
     TemplateError,
     Unauthorized,
 )
-from homeassistant.helpers import config_validation as cv, recorder, template
+from homeassistant.helpers import cluster, config_validation as cv, recorder, template
 from homeassistant.helpers.http import MIN_COMPRESSED_RESPONSE_SIZE
 from homeassistant.helpers.json import json_dumps, json_fragment
 from homeassistant.helpers.service import async_get_all_descriptions
@@ -403,10 +403,14 @@ class APIDomainServicesView(HomeAssistantView):
             )
 
         context = self.context(request)
+        response_requested = "return_response" in request.query
         if not hass.services.has_service(domain, service):
-            raise HTTPBadRequest from ServiceNotFound(domain, service)
-
-        if response_requested := "return_response" in request.query:
+            # In a cluster, a service of an integration that runs on another
+            # instance is not registered here: the call is routed to that
+            # instance, which checks the service and its response itself.
+            if not cluster.async_is_clustered(hass):
+                raise HTTPBadRequest from ServiceNotFound(domain, service)
+        elif response_requested:
             if (
                 hass.services.supports_response(domain, service)
                 is ha.SupportsResponse.NONE

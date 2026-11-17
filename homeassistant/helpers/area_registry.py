@@ -458,9 +458,10 @@ class AreaRegistry(BaseRegistry[AreasRegistryStoreData]):
     @override
     async def _async_load(self) -> None:
         """Load the area registry."""
-        self._async_setup_cleanup()
+        if self._replacement is None:
+            self._async_setup_cleanup()
 
-        data = await self._store.async_load()
+        data = await self._async_load_stored()
 
         areas = AreaRegistryItems()
 

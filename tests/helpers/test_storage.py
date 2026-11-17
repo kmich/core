@@ -1565,3 +1565,67 @@ async def test_file_store_io_private_permissions(
         await store.async_remove()
         assert not await hass.async_add_executor_job(os.path.exists, store.path)
         await hass.async_stop(force=True)
+
+
+async def test_store_write_listener(
+    hass: HomeAssistant, store: storage.Store, hass_storage: dict[str, Any]
+) -> None:
+    """Write listeners get the key and the content as written."""
+    writes: list[tuple[str, str | bytes]] = []
+    remove = storage.async_track_store_writes(
+        hass, lambda key, content: writes.append((key, content)), [MOCK_KEY]
+    )
+
+    await store.async_save(MOCK_DATA)
+    assert [key for key, _ in writes] == [MOCK_KEY]
+    assert json.loads(writes[0][1])["data"] == MOCK_DATA
+
+    remove()
+    await store.async_save(MOCK_DATA2)
+    assert len(writes) == 1
+
+
+async def test_store_write_listener_error_does_not_fail_the_write(
+    hass: HomeAssistant,
+    store: storage.Store,
+    hass_storage: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing write listener is logged; the store is still written."""
+
+    def _raise(key: str, content: str | bytes) -> None:
+        raise RuntimeError("listener failed")
+
+    storage.async_track_store_writes(hass, _raise, [MOCK_KEY])
+    await store.async_save(MOCK_DATA)
+    assert hass_storage[MOCK_KEY]["data"] == MOCK_DATA
+    assert "Error in store write listener for storage-test" in caplog.text
+
+
+async def test_store_write_listener_skips_private_stores(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    """Private stores (credentials, tokens) are never passed to listeners."""
+    writes: list[str] = []
+    storage.async_track_store_writes(
+        hass, lambda key, content: writes.append(key), ["private-test"]
+    )
+
+    private = storage.Store(hass, MOCK_VERSION, "private-test", private=True)
+    await private.async_save(MOCK_DATA)
+    assert hass_storage["private-test"]["data"] == MOCK_DATA
+    assert writes == []
+
+
+async def test_store_write_listener_only_sees_the_stores_it_asked_for(
+    hass: HomeAssistant, store: storage.Store, hass_storage: dict[str, Any]
+) -> None:
+    """A listener is not handed the content of stores it did not name."""
+    writes: list[str] = []
+    storage.async_track_store_writes(
+        hass, lambda key, content: writes.append(key), ["some-other-store"]
+    )
+
+    await store.async_save(MOCK_DATA)
+
+    assert writes == []
